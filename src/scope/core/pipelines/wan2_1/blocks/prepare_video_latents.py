@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import torch
@@ -41,6 +42,12 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
                 required=True,
                 type_hint=list[torch.Tensor] | torch.Tensor,
                 description="Input video to convert into noisy latents",
+            ),
+            InputParam(
+                "fixed_noise",
+                type_hint=bool,
+                default=None,
+                description="Reuse the same noise every chunk (local patch; overrides SCOPE_FIXED_NOISE)",
             ),
             InputParam(
                 "base_seed",
@@ -88,7 +95,15 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
             base_seed = 42
 
         # Create generator from seed for reproducible generation
-        block_seed = base_seed + block_state.current_start_frame
+        # Local patch (ai-character-scope): SCOPE_FIXED_NOISE=1 reuses the same noise every chunk
+        # (as StreamDiffusion v1 does) to cut frame-to-frame shimmer from fresh random noise.
+        fixed = block_state.fixed_noise
+        if fixed is None:
+            fixed = os.environ.get("SCOPE_FIXED_NOISE") == "1"
+        if fixed:
+            block_seed = base_seed
+        else:
+            block_seed = base_seed + block_state.current_start_frame
         rng = torch.Generator(device=components.config.device).manual_seed(block_seed)
 
         # Generate empty latents (noise)
