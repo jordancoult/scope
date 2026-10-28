@@ -30,6 +30,28 @@ logger = logging.getLogger(__name__)
 FrameCallback = Callable[[str | None, "np.ndarray", int | None, Fraction | None], None]
 
 
+
+def _put_newest(q: queue.Queue, item) -> bool:
+    """Enqueue *item*; if the queue is full, drop the OLDEST frame instead of the new one.
+
+    Local patch (ai-character-scope): stock Scope dropped the incoming frame, so whenever the
+    pipeline ran slower than the camera the queue stayed full of ~1 s-old frames (measured
+    1.6 s end to end at the 15 FPS preset). Keeping the newest frames bounds that staleness.
+    """
+    try:
+        q.put_nowait(item)
+        return True
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
+
 class SourceManager:
     """Manages input sources and source-queue routing for FrameProcessor.
 
@@ -129,9 +151,7 @@ class SourceManager:
             return False
 
         for sq in queues:
-            try:
-                sq.put_nowait(frame_tensor)
-            except queue.Full:
+            if not _put_newest(sq, frame_tensor):
                 logger.debug(
                     "Source node %s queue full, dropping frame", source_node_id
                 )
@@ -144,9 +164,7 @@ class SourceManager:
             return False
 
         for sq in self._graph_source_queues:
-            try:
-                sq.put_nowait(frame_tensor)
-            except queue.Full:
+            if not _put_newest(sq, frame_tensor):
                 logger.debug(
                     "Graph source queue full, dropping %s frame", self._source_type
                 )

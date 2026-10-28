@@ -29,6 +29,8 @@ DEFAULT_INPUT_QUEUE_MAXSIZE = 30
 DEFAULT_OUTPUT_QUEUE_MAXSIZE = 8
 # Local patch (ai-character-scope): pipeline->WebRTC sink queue cap; at ~30 fps the stock 30
 # frames is ~1 s of potential latency.
+# Source->pipeline input queue cap (stock 30 = ~1 s of camera frames when the model is slower).
+INPUT_QUEUE_MAXSIZE = int(__import__("os").environ.get("SCOPE_INPUT_QUEUE_MAX", str(DEFAULT_INPUT_QUEUE_MAXSIZE)))
 SINK_QUEUE_MAXSIZE = int(__import__("os").environ.get("SCOPE_SINK_QUEUE_MAX", str(DEFAULT_INPUT_QUEUE_MAXSIZE)))
 
 
@@ -119,7 +121,7 @@ def build_graph(
                     f"Fan-in to a single port is not supported."
                 )
             both_nodes = e.from_node in _node_ids and e.to_node in _node_ids
-            size = 1 if both_nodes else DEFAULT_INPUT_QUEUE_MAXSIZE
+            size = 1 if both_nodes else INPUT_QUEUE_MAXSIZE
             stream_queues[key] = queue.Queue(maxsize=size)
 
     # 2) Create a processor per pipeline/custom node and wire input_queues
