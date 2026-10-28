@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import fractions
 import logging
 import queue
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+
+# Frames of cushion kept in the output queue before pacing speeds up (0 = stock behaviour).
+LOW_LATENCY_TARGET = int(os.environ.get("SCOPE_OUTPUT_TARGET_FRAMES", "0"))
 
 async def _next_timestamp(
     track: MediaStreamTrack,
@@ -340,6 +345,13 @@ class VideoProcessingTrack(MediaStreamTrack):
             try:
                 if self.frame_processor:
                     self._ts["fps"] = self.frame_processor.get_fps()
+                    # Local patch (ai-character-scope): pacing at exactly the production rate
+                    # never drains a backlog, so a queue filled during warm-up stayed full
+                    # (~1 s of latency). Send faster while more than a small cushion is queued.
+                    if LOW_LATENCY_TARGET > 0:
+                        backlog = self.frame_processor.output_backlog()
+                        if backlog > LOW_LATENCY_TARGET:
+                            self._ts["fps"] *= 1.0 + min(0.5, 0.05 * (backlog - LOW_LATENCY_TARGET))
 
                 # If paused, wait for the appropriate frame interval before returning
                 with self._paused_lock:

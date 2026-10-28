@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 # Use larger size for inter-pipeline queues so downstream can accumulate a full chunk
 DEFAULT_INPUT_QUEUE_MAXSIZE = 30
 DEFAULT_OUTPUT_QUEUE_MAXSIZE = 8
+# Local patch (ai-character-scope): pipeline->WebRTC sink queue cap; at ~30 fps the stock 30
+# frames is ~1 s of potential latency.
+SINK_QUEUE_MAXSIZE = int(__import__("os").environ.get("SCOPE_SINK_QUEUE_MAX", str(DEFAULT_INPUT_QUEUE_MAXSIZE)))
 
 
 @dataclass
@@ -256,7 +259,7 @@ def build_graph(
                 sink_mode = sink_node.sink_mode
                 # WebRTC preview reads sink_queues_by_node; NDI/Spout/Syphon threads
                 # must use a separate queue or they steal frames from get_from_sink().
-                sink_q = queue.Queue(maxsize=DEFAULT_INPUT_QUEUE_MAXSIZE)
+                sink_q = queue.Queue(maxsize=SINK_QUEUE_MAXSIZE)
                 sink_queues_by_node[sink_id] = sink_q
                 queues_to_add = [sink_q]
                 if sink_mode in ("ndi", "spout", "syphon"):

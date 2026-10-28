@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 # FPS calculation constants
 DEFAULT_FPS = 30.0  # Default FPS
+_LATENCY_TRACE = __import__("os").environ.get("SCOPE_LATENCY_TRACE") == "1"
 
 # Heartbeat interval for stream stats logging and Kafka events
 HEARTBEAT_INTERVAL_SECONDS = 10.0
@@ -561,7 +562,13 @@ class FrameProcessor:
             return True
 
         # Local mode: convert and route to source node queues
-        frame_tensor = self._frame_array_to_tensor(frame.to_ndarray(format="rgb24"))
+        arr = frame.to_ndarray(format="rgb24")
+        if _LATENCY_TRACE:  # local patch: log arrival of flash frames (monotonic clock)
+            luma = float(arr[::8, ::8].mean())
+            if luma > 200 and getattr(self, "_trace_in_prev", 0) <= 200:
+                logger.info(f"[LATENCY-TRACE] flash arrived t={time.perf_counter():.4f}")
+            self._trace_in_prev = luma
+        frame_tensor = self._frame_array_to_tensor(arr)
         tb = Fraction(frame.time_base) if frame.time_base is not None else None
         packet = VideoPacket(
             tensor=frame_tensor,
@@ -597,6 +604,13 @@ class FrameProcessor:
         """
         return self.sink_manager.get_unhandled_sink_node_ids()
 
+    def output_backlog(self) -> int:
+        """Frames waiting in the sink output queue (local patch: latency-aware pacing)."""
+        sink = self._sink_processor
+        if self._cloud_relay is not None or sink is None or not sink.output_queue:
+            return 0
+        return sink.output_queue.qsize()
+
     def get_packet(self) -> VideoPacket | None:
         if not self.running:
             return None
@@ -617,12 +631,24 @@ class FrameProcessor:
                 return None
 
             try:
+                if _LATENCY_TRACE:  # local patch: queue occupancy trace
+                    self._trace_n = getattr(self, "_trace_n", 0) + 1
+                    if self._trace_n % 30 == 0:
+                        in_q = {k: q.qsize() for k, q in self._sink_processor.input_queues.items()} if hasattr(self._sink_processor, "input_queues") else {}
+                        logger.info(f"[LATENCY-TRACE] sink output queue={self._sink_processor.output_queue.qsize()} (max {self._sink_processor.output_queue.maxsize}) input queues={in_q}")
                 packet = ensure_video_packet(
                     self._sink_processor.output_queue.get_nowait()
                 )
                 frame = packet.tensor.squeeze(0)
                 if frame.is_cuda:
                     frame = frame.cpu()
+                if _LATENCY_TRACE:  # local patch: log emission of flash frames
+                    luma = float(frame[::8, ::8].float().mean())
+                    base = getattr(self, "_trace_out_base", luma)
+                    if luma > base + 60 and getattr(self, "_trace_out_prev", 999) <= base + 60:
+                        logger.info(f"[LATENCY-TRACE] flash emitted t={time.perf_counter():.4f}")
+                    self._trace_out_prev = luma
+                    self._trace_out_base = 0.95 * base + 0.05 * min(luma, base + 20)
                 packet = VideoPacket(tensor=frame, timestamp=packet.timestamp)
             except queue.Empty:
                 return None
