@@ -17,6 +17,7 @@ from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch
 import math
+import os
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -59,6 +60,89 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         # append to collection
         output.append(x_i)
     return torch.stack(output).type_as(x)
+
+
+# Local patch (ai-character-scope): fused clean-KV refresh. When > 0, the first
+# FUSED_PREFIX_TOKENS tokens of the current call are the previous chunk's clean latents
+# (t=0) being re-cached; they must not attend to the new chunk's tokens. Set by DenoiseBlock.
+FUSED_PREFIX_TOKENS = 0
+
+
+def _kv_index(kv_cache, key):
+    """Host-side mirror of kv_cache[key] (local patch, ai-character-scope).
+
+    Reading the index tensors with .item() forces a GPU sync in every block (~4 per block x 30
+    blocks per forward), which drained the CUDA queue and left the GPU idle ~25% of each chunk.
+    The mirror is keyed on the tensor object so cache resets (which assign new tensors) re-read it.
+    """
+    tensor = kv_cache[key]
+    mirror = kv_cache.get("_host_" + key)
+    if mirror is None or mirror[0] is not tensor:
+        mirror = (tensor, int(tensor.item()))
+        kv_cache["_host_" + key] = mirror
+    return mirror[1]
+
+
+def _set_kv_index(kv_cache, key, value):
+    kv_cache[key].fill_(value)
+    kv_cache["_host_" + key] = (kv_cache[key], int(value))
+
+
+# Local patch (ai-character-scope): ring-buffer KV cache. The stock rolling cache shifts (clones)
+# the whole window in every block once it is full, ~10% of GPU time per chunk. Attention does
+# not depend on key order (RoPE is already applied to cached keys), so overwrite the oldest
+# non-sink frame's slot in place instead: same set of keys, no copies. Frame-granular; falls
+# back to the stock path if the cache size is not a whole number of frames.
+RING_KV = os.environ.get("SCOPE_RING_KV") == "1"
+
+
+def _ring_state(kv_cache):
+    """Host-side frame->slot map, reset whenever the cache's index tensors are replaced."""
+    state = kv_cache.get("_ring")
+    if state is None or state["token"] is not kv_cache["global_end_index"]:
+        state = {"token": kv_cache["global_end_index"], "slots": {}, "filled": 0}
+        kv_cache["_ring"] = state
+    return state
+
+
+def _ring_write(kv_cache, state, frame, k, v, frame_seqlen, capacity, sink_frames):
+    slots = state["slots"]
+    slot = slots.get(frame)
+    if slot is None:
+        if state["filled"] < capacity:
+            slot = state["filled"]
+            state["filled"] += 1
+        else:
+            oldest = min(f for f in slots if f >= sink_frames)
+            slot = slots.pop(oldest)
+        slots[frame] = slot
+    a = slot * frame_seqlen
+    kv_cache["k"][:, a : a + frame_seqlen] = k
+    kv_cache["v"][:, a : a + frame_seqlen] = v
+
+
+def _ring_kv_attention(kv_cache, q, k, v, current_start, frame_seqlen, sink_tokens):
+    state = _ring_state(kv_cache)
+    capacity = kv_cache["k"].shape[1] // frame_seqlen
+    sink_frames = sink_tokens // frame_seqlen
+    first = current_start // frame_seqlen
+    n_frames = q.shape[1] // frame_seqlen
+    prefix_frames = FUSED_PREFIX_TOKENS // frame_seqlen if FUSED_PREFIX_TOKENS else 0
+    outs = []
+    # Fused clean-KV prefix: write it and attend *before* the new frames exist in the cache.
+    groups = [(0, prefix_frames), (prefix_frames, n_frames)] if 0 < prefix_frames < n_frames else [(0, n_frames)]
+    for g0, g1 in groups:
+        for i in range(g0, g1):
+            t = slice(i * frame_seqlen, (i + 1) * frame_seqlen)
+            _ring_write(kv_cache, state, first + i, k[:, t], v[:, t], frame_seqlen, capacity, sink_frames)
+        n = state["filled"] * frame_seqlen
+        outs.append(attention(q[:, g0 * frame_seqlen : g1 * frame_seqlen], kv_cache["k"][:, :n], kv_cache["v"][:, :n]))
+    end = current_start + q.shape[1]
+    # Keep the stock index tensors meaningful for any other reader (host-mirrored, no sync).
+    _set_kv_index(kv_cache, "global_end_index", end)
+    _set_kv_index(kv_cache, "local_end_index", state["filled"] * frame_seqlen)
+    state["token"] = kv_cache["global_end_index"]
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -172,70 +256,97 @@ class CausalWanSelfAttention(nn.Module):
                 k, grid_sizes, freqs, start_frame=current_start_frame
             ).type_as(v)
 
-            current_end = current_start + roped_query.shape[1]
-            # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
-            if (current_end > kv_cache["global_end_index"].item()) and (
-                num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size
-            ):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = (
-                    num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+            if RING_KV and kv_cache["k"].shape[1] % frame_seqlen == 0:
+                x = _ring_kv_attention(
+                    kv_cache, roped_query, roped_key, v, current_start, frame_seqlen, sink_tokens
                 )
-                num_rolled_tokens = (
-                    kv_cache["local_end_index"].item()
-                    - num_evicted_tokens
-                    - sink_tokens
-                )
-                kv_cache["k"][:, sink_tokens : sink_tokens + num_rolled_tokens] = (
-                    kv_cache["k"][
-                        :,
-                        sink_tokens + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                )
-                kv_cache["v"][:, sink_tokens : sink_tokens + num_rolled_tokens] = (
-                    kv_cache["v"][
-                        :,
-                        sink_tokens + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                )
-                # Insert the new keys/values at the end
-                local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                    - num_evicted_tokens
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
-
             else:
-                # Assign new keys/values directly up to current_end
-                local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                )
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+                current_end = current_start + roped_query.shape[1]
+                # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
+                kv_cache_size = kv_cache["k"].shape[1]
+                num_new_tokens = roped_query.shape[1]
+                # Tokens beyond what the cache already holds. Equals num_new_tokens for normal calls;
+                # smaller when a fused call re-writes the previous chunk (local patch).
+                num_growth_tokens = current_end - _kv_index(kv_cache, "global_end_index")
+                if (num_growth_tokens > 0) and (
+                    num_growth_tokens + _kv_index(kv_cache, "local_end_index") > kv_cache_size
+                ):
+                    # Calculate the number of new tokens added in this step
+                    # Shift existing cache content left to discard oldest tokens
+                    # Clone the source slice to avoid overlapping memory error
+                    num_evicted_tokens = (
+                        num_growth_tokens + _kv_index(kv_cache, "local_end_index") - kv_cache_size
+                    )
+                    num_rolled_tokens = (
+                        _kv_index(kv_cache, "local_end_index")
+                        - num_evicted_tokens
+                        - sink_tokens
+                    )
+                    kv_cache["k"][:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                        kv_cache["k"][
+                            :,
+                            sink_tokens + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                        ].clone()
+                    )
+                    kv_cache["v"][:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                        kv_cache["v"][
+                            :,
+                            sink_tokens + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                        ].clone()
+                    )
+                    # Insert the new keys/values at the end
+                    local_end_index = (
+                        _kv_index(kv_cache, "local_end_index")
+                        + current_end
+                        - _kv_index(kv_cache, "global_end_index")
+                        - num_evicted_tokens
+                    )
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
 
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, :local_end_index],
-                kv_cache["v"][:, :local_end_index],
-            )
+                else:
+                    # Assign new keys/values directly up to current_end
+                    local_end_index = (
+                        _kv_index(kv_cache, "local_end_index")
+                        + current_end
+                        - _kv_index(kv_cache, "global_end_index")
+                    )
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
 
-            kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
+                prefix = FUSED_PREFIX_TOKENS
+                if 0 < prefix < num_new_tokens:
+                    prefix_end = local_end_index - (num_new_tokens - prefix)
+                    x = torch.cat(
+                        [
+                            attention(
+                                roped_query[:, :prefix],
+                                kv_cache["k"][:, :prefix_end],
+                                kv_cache["v"][:, :prefix_end],
+                            ),
+                            attention(
+                                roped_query[:, prefix:],
+                                kv_cache["k"][:, :local_end_index],
+                                kv_cache["v"][:, :local_end_index],
+                            ),
+                        ],
+                        dim=1,
+                    )
+                else:
+                    x = attention(
+                        roped_query,
+                        kv_cache["k"][:, :local_end_index],
+                        kv_cache["v"][:, :local_end_index],
+                    )
+
+                _set_kv_index(kv_cache, "global_end_index", current_end)
+                _set_kv_index(kv_cache, "local_end_index", local_end_index)
 
         # output
         x = x.flatten(2)

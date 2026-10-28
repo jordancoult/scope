@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import torch
@@ -86,6 +87,12 @@ class CleanKVCacheBlock(ModularPipelineBlocks):
     @torch.no_grad()
     def __call__(self, components, state: PipelineState) -> tuple[Any, PipelineState]:
         block_state = self.get_block_state(state)
+        # Local patch (ai-character-scope): with SCOPE_FUSED_KV=1 the clean-KV refresh happens
+        # inside the next chunk's denoising forward (see DenoiseBlock), so skip it here.
+        # SCOPE_SKIP_CLEAN_KV=1 skips it entirely (faster, visibly worse; experiment only).
+        if os.environ.get("SCOPE_FUSED_KV") == "1" or os.environ.get("SCOPE_SKIP_CLEAN_KV") == "1":
+            self.set_block_state(state, block_state)
+            return components, state
 
         scale_size = (
             components.config.vae_spatial_downsample_factor

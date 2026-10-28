@@ -18,6 +18,8 @@ from ..wan2_1.vace.blocks import VaceEncodingBlock
 
 logger = diffusers_logging.get_logger(__name__)
 
+from .depth_vace_block import DepthVaceBlock
+
 # Main pipeline blocks with multi-mode support (text-to-video and video-to-video)
 # AutoPreprocessVideoBlock: Routes to video preprocessing when 'video' input provided
 # AutoPrepareLatentsBlock: Routes to PrepareVideoLatentsBlock or PrepareLatentsBlock
@@ -29,6 +31,8 @@ ALL_BLOCKS = InsertableDict(
         ("set_timesteps", SetTimestepsBlock),
         ("setup_caches", SetupCachesBlock),
         ("auto_preprocess_video", AutoPreprocessVideoBlock),
+        # Local patch (ai-character-scope): optional depth maps -> vace_input_frames
+        ("depth_vace", DepthVaceBlock),
         ("auto_prepare_latents", AutoPrepareLatentsBlock),
         ("vace_encoding", VaceEncodingBlock),
         ("denoise", DenoiseBlock),

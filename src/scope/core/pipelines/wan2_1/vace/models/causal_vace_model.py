@@ -434,19 +434,35 @@ class CausalVaceWanModel(nn.Module):
         # Generate VACE hints
         hints = None
         if vace_context is not None:
+            # Local patch (ai-character-scope): in a fused clean-KV call the leading tokens are
+            # the previous chunk at t=0; VACE conditions only the new chunk, as in the unfused
+            # flow, so compute hints on the new-chunk slice and zero-pad the prefix.
+            from scope.core.pipelines.streamdiffusionv2.modules import causal_model as _cm
+
+            prefix = _cm.FUSED_PREFIX_TOKENS
+            vx, ve0, vlens, vgrid = x, e0, seq_lens, grid_sizes
+            if prefix > 0:
+                frame_tokens = int(grid_sizes[0][1] * grid_sizes[0][2])
+                prefix_frames = prefix // frame_tokens
+                vx, ve0 = x[:, prefix:], e0[:, prefix_frames:]
+                vlens = seq_lens - prefix
+                vgrid = grid_sizes.clone()
+                vgrid[:, 0] -= prefix_frames
             hints = self.forward_vace(
-                x,
+                vx,
                 vace_context,
                 seq_len,
-                e0,
-                seq_lens,
-                grid_sizes,
+                ve0,
+                vlens,
+                vgrid,
                 self.causal_wan_model.freqs,
                 context,
                 context_lens,
                 self.causal_wan_model.block_mask,
                 crossattn_cache,
             )
+            if prefix > 0:
+                hints = tuple(torch.nn.functional.pad(h, (0, 0, prefix, 0)) for h in hints)
 
         # Base arguments for transformer blocks (shared across all blocks)
         base_kwargs = {
