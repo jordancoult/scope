@@ -243,6 +243,8 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         # Local patch (ai-character-scope): live attention steering (see attention_steer.py)
         if kwargs.get("attention_weights") is not None:
             attention_steer.set_weights(kwargs["attention_weights"])
+        if kwargs.get("sink_frames") is not None:
+            attention_steer.set_sink_frames(self.components.generator.model, kwargs["sink_frames"])
 
         for k, v in kwargs.items():
             self.state.set(k, v)

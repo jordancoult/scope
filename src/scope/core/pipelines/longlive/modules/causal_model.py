@@ -13,7 +13,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from scope.core.pipelines.wan2_1.modules.attention import attention
-from scope.core.pipelines.wan2_1.modules.attention_steer import steered_attention
+from scope.core.pipelines.wan2_1.modules.attention_steer import scale_cross, steered_attention
 from .model import (
     WAN_CROSSATTENTION_CLASSES,
     MLPProj,
@@ -536,9 +536,9 @@ class CausalWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(
+            x = x + scale_cross(self.cross_attn(
                 self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache
-            )
+            ))
             y = self.ffn(
                 (
                     self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
