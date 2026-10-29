@@ -1,6 +1,5 @@
 # Modified from https://github.com/chenfengxu714/StreamdiffusionV2
 from scope.core.pipelines.wan2_1.modules.attention import attention
-from scope.core.pipelines.wan2_1.modules.attention_steer import steered_attention
 from .model import (
     WanRMSNorm,
     rope_apply,
@@ -326,27 +325,24 @@ class CausalWanSelfAttention(nn.Module):
                     prefix_end = local_end_index - (num_new_tokens - prefix)
                     x = torch.cat(
                         [
-                            steered_attention(
+                            attention(
                                 roped_query[:, :prefix],
                                 kv_cache["k"][:, :prefix_end],
                                 kv_cache["v"][:, :prefix_end],
-                                sink_tokens,
                             ),
-                            steered_attention(
+                            attention(
                                 roped_query[:, prefix:],
                                 kv_cache["k"][:, :local_end_index],
                                 kv_cache["v"][:, :local_end_index],
-                                sink_tokens,
                             ),
                         ],
                         dim=1,
                     )
                 else:
-                    x = steered_attention(
+                    x = attention(
                         roped_query,
                         kv_cache["k"][:, :local_end_index],
                         kv_cache["v"][:, :local_end_index],
-                        sink_tokens,
                     )
 
                 _set_kv_index(kv_cache, "global_end_index", current_end)
