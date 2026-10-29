@@ -17,6 +17,7 @@ from ..defaults import (
 from ..interface import Pipeline, Requirements
 from ..process import postprocess_chunk
 from ..utils import Quantization, load_model_config, validate_resolution
+from ..wan2_1.modules import attention_steer
 from ..wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
 from ..wan2_1.lora.mixin import LoRAEnabledPipeline
 from ..wan2_1.vace import VACEEnabledPipeline
@@ -268,6 +269,10 @@ class StreamDiffusionV2Pipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeli
             # Trigger cache reset on LoRA scale updates if manage_cache is enabled
             if self.state.get("manage_cache", True):
                 kwargs["init_cache"] = True
+
+        # Local patch (ai-character-scope): live attention steering (see attention_steer.py)
+        if kwargs.get("attention_weights") is not None:
+            attention_steer.set_weights(kwargs["attention_weights"])
 
         for k, v in kwargs.items():
             self.state.set(k, v)

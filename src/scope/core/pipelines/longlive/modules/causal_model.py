@@ -13,6 +13,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from scope.core.pipelines.wan2_1.modules.attention import attention
+from scope.core.pipelines.wan2_1.modules.attention_steer import steered_attention
 from .model import (
     WAN_CROSSATTENTION_CLASSES,
     MLPProj,
@@ -409,13 +410,14 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
-                x = attention(roped_query, k_cat, v_cat)
+                x = steered_attention(roped_query, k_cat, v_cat, sink_tokens)
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
-                x = attention(
+                x = steered_attention(
                     roped_query,
                     temp_k[:, window_start:local_end_index],
                     temp_v[:, window_start:local_end_index],
+                    0,
                 )
 
         # output
