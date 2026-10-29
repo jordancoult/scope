@@ -16,6 +16,7 @@ from diffusers.modular_pipelines.modular_pipeline_utils import (
 
 
 FUSED_KV = os.environ.get("SCOPE_FUSED_KV") == "1"
+NOISE_T_OFFSET = int(os.environ.get("SCOPE_NOISE_T_OFFSET", "100"))
 
 class DenoiseBlock(ModularPipelineBlocks):
     @property
@@ -189,7 +190,10 @@ class DenoiseBlock(ModularPipelineBlocks):
         if block_state.noise_scale is not None:
             # Higher noise scale -> more denoising steps, more intense changes to input
             # Lower noise scale -> less denoising steps, less intense changes to input
-            denoising_step_list[0] = int(1000 * block_state.noise_scale) - 100
+            # Local patch (ai-character-scope): the -100 means the model is told less noise than was
+            # mixed in. StreamDiffusionV2 is tuned for that; other models leave the rest as residual
+            # noise. SCOPE_NOISE_T_OFFSET overrides it (0 = tell the true noise level).
+            denoising_step_list[0] = int(1000 * block_state.noise_scale) - NOISE_T_OFFSET
 
         # Denoising loop
         for index, current_timestep in enumerate(denoising_step_list):
