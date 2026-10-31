@@ -78,3 +78,28 @@ def set_sink_frames(model, frames: int) -> None:
     for m in model.modules():
         if hasattr(m, "sink_size") and isinstance(m.sink_size, int):
             m.sink_size = int(frames)
+
+
+def refresh_sink_slot(kv_cache, model, frame_seqlen: int, slot: int) -> bool:
+    """Keyframe memory: copy the newest cached latent frame into sink slot `slot` of every block.
+
+    The sink is never evicted, so refreshing one slot every few seconds (rotating through the
+    slots) keeps keyframes of staggered ages (e.g. 0-7, 7-14, 14-21 s with 3 slots every 7 s):
+    a longer horizon at no extra attention cost. Keys keep their original RoPE position, so the
+    model sees them as genuinely older moments. Returns False when there is nothing to copy yet.
+    """
+    sink = getattr(model, "_steer_sink_frames", None)
+    if sink is None:
+        sink = next((m.sink_size for m in model.modules() if isinstance(getattr(m, "sink_size", None), int)), 0)
+    if sink <= 0 or not kv_cache:
+        return False
+    slot %= sink
+    le = int(kv_cache[0]["local_end_index"].item())
+    if le < (sink + 1) * frame_seqlen:
+        return False
+    dst = slice(slot * frame_seqlen, (slot + 1) * frame_seqlen)
+    src = slice(le - frame_seqlen, le)
+    for kv in kv_cache:
+        kv["k"][:, dst] = kv["k"][:, src]
+        kv["v"][:, dst] = kv["v"][:, src]
+    return True

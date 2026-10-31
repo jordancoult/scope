@@ -287,4 +287,18 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         apply_mode_defaults_to_state(self.state, self.__class__, mode, kwargs)
 
         _, self.state = self.blocks(self.components, self.state)
+
+        # Local patch (ai-character-scope): keyframe memory, refresh one sink slot every N seconds
+        refresh = float(kwargs.get("sink_refresh_s") or 0)
+        if refresh > 0:
+            now = time.monotonic()
+            if self.state.get("current_start_frame") in (None, 0) or not hasattr(self, "_sink_refresh_t"):
+                self._sink_refresh_t, self._sink_refresh_slot = now, 0
+            elif now - self._sink_refresh_t >= refresh:
+                h, w = self.state.get("height"), self.state.get("width")
+                if attention_steer.refresh_sink_slot(
+                    self.state.get("kv_cache"), self.components.generator.model, (h // 16) * (w // 16), self._sink_refresh_slot
+                ):
+                    self._sink_refresh_slot += 1
+                self._sink_refresh_t = now
         return {"video": postprocess_chunk(self.state.values["output_video"])}
