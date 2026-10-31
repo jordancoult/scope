@@ -32,7 +32,8 @@ def set_weights(weights: dict | None) -> None:
         return
     for key in _weights:
         if key in weights and weights[key] is not None:
-            _weights[key] = min(4.0, max(0.0 if key == "text" else 0.05, float(weights[key])))
+            # 0 cuts a region off entirely (log 0 = -inf); "current" keeps a floor so every query has keys
+            _weights[key] = min(4.0, max(0.05 if key == "current" else 0.0, float(weights[key])))
     vals = torch.tensor([_weights["sink"], _weights["recent"], _weights["current"]]).log()
     if _log_w is None:
         _log_w = vals.cuda()
@@ -56,8 +57,9 @@ def steered_attention(q, k, v, sink_tokens: int):
     if not ACTIVE:
         return attention(q, k, v)
     lq, lk = q.shape[1], k.shape[1]
-    sink_end = min(sink_tokens, lk)
-    cur_start = max(lk - lq, sink_end)
+    # the chunk's own tokens take priority: on the first chunk after a reset everything is "current"
+    cur_start = max(lk - lq, 0)
+    sink_end = min(sink_tokens, cur_start)
     idx = torch.ones(lk, dtype=torch.long, device=q.device)
     idx[:sink_end] = 0
     idx[cur_start:] = 2
