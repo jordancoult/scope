@@ -261,6 +261,13 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         if "vace_ref_images" not in kwargs:
             self.state.set("vace_ref_images", None)
 
+        # Local patch (ai-character-scope): clear VACE input frames/masks too (as in streamdiffusionv2),
+        # otherwise after depth or "camera as VACE input" is switched off every later chunk keeps
+        # conditioning on the last stale chunk: a frozen pose, and slower.
+        for key in ("vace_input_frames", "vace_input_masks"):
+            if key not in kwargs:
+                self.state.set(key, None)
+
         # Clear extension mode frame images from state if not provided to prevent reuse on non-extension chunks
         if "first_frame_image" not in kwargs:
             self.state.set("first_frame_image", None)
