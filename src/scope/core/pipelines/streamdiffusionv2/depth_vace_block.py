@@ -31,6 +31,9 @@ class DepthVaceBlock(ModularPipelineBlocks):
             InputParam("vace_input_frames", default=None, type_hint=torch.Tensor | None),
             InputParam("depth_vace", default=False, type_hint=bool),
             InputParam("init_cache", default=False, type_hint=bool),
+            # Body-only depth: depth below this (normalized 0..1, 1 = nearest) becomes neutral gray,
+            # VACE's "no information" value, so the model invents the background. 0 = off.
+            InputParam("depth_cutoff", default=0.0, type_hint=float),
         ]
 
     @property
@@ -48,6 +51,12 @@ class DepthVaceBlock(ModularPipelineBlocks):
                 self._depth = GpuStreamingDepth(device=video.device)
             if block_state.init_cache:
                 self._depth.reset()
-            block_state.vace_input_frames = self._depth(video)
+            frames = self._depth(video)
+            c = float(block_state.depth_cutoff or 0.0)
+            if c > 0:
+                d = (frames[:, :1] + 1) / 2  # [B, 1, T, H, W] in 0..1
+                w = ((d - (c - 0.06)) / 0.12).clamp(0, 1)  # soft edge around the cutoff
+                frames = frames * w  # background -> 0 (gray = unknown to VACE)
+            block_state.vace_input_frames = frames
         self.set_block_state(state, block_state)
         return components, state
