@@ -204,6 +204,11 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         components.add("embedding_blender", embedding_blender)
 
         self.blocks = LongLiveBlocks()
+        # Local patch (ai-character-scope): preload the depth model (see streamdiffusionv2/pipeline.py)
+        if os.environ.get("SCOPE_PRELOAD_DEPTH") == "1" and getattr(config, "vace_path", None):
+            from ..video_depth_anything.gpu_depth import GpuStreamingDepth
+
+            self.blocks.sub_blocks["depth_vace"]._depth = GpuStreamingDepth(device=device)
         self.components = components
         self.state = PipelineState()
         # These need to be set right now because InputParam.default on the blocks
