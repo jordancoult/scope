@@ -17,67 +17,23 @@ attention_weights={"sink": .., "recent": .., "current": .., "text": ..}.
 import torch
 import torch.nn.functional as F
 
-from .attention import attention
+from .attention import attention, flash_attention
 
 _weights = {"sink": 1.0, "recent": 1.0, "current": 1.0, "text": 1.0}
 _log_w = None  # [3] float32 CUDA tensor; a tensor so torch.compile doesn't recompile per value
 _text_w = None  # [1] float32 CUDA tensor
 ACTIVE = False
 TEXT_ACTIVE = False
-BACKEND = "flash"  # self-attention kernel when not steering: "flash" (stock, exact), "sage2", "sage2first"
+BACKEND = "default"  # "default" = Scope's attention() (SageAttention when installed, as always),
+# "flash" = exact flash-attention, "sage2first" = default on the first denoising step, exact flash after
 PASS_STEP = -1  # current denoising step index (set by DenoiseBlock); -1 outside denoising
-_sage2 = None
 
 
 def set_backend(name: str | None) -> None:
-    """Live attention-kernel switch. "sage2" = SageAttention 2.2 (int8 QK, fp8 PV; ~2x faster
-    attention, approximate), loaded from the project folder so Scope's own auto-detection (which
-    would switch every pipeline to Sage) stays off. Falls back to flash if it can't load."""
-    global BACKEND, _sage2
-    name = (name or "flash").lower()
-    if name in ("sage2", "sage2first") and _sage2 is None:
-        try:
-            import os, sys
-            path = os.path.expanduser(os.environ.get("SCOPE_SAGE2_PATH", "~/personal/ai-character-scope/longlive2/.sage2/pkg"))
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            from sageattention import sageattn
-
-            @torch.library.custom_op("aics::sage2", mutates_args=(), device_types="cuda")
-            def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-                return sageattn(q.contiguous(), k.contiguous(), v.contiguous(), tensor_layout="NHD", is_causal=False)
-
-            @_op.register_fake
-            def _(q, k, v):
-                return torch.empty_like(q)
-
-            _sage2 = _op
-            print(f"[attention] SageAttention 2 loaded from {path}", flush=True)
-        except Exception as e:  # missing wheel / incompatible GPU: stay exact
-            print(f"[attention] SageAttention 2 unavailable ({e}); using flash-attention", flush=True)
-            name = "flash"
-    BACKEND = name if name in ("flash", "sage2", "sage2first") else "flash"
-
-
-def set_weights(weights: dict | None) -> None:
-    global _log_w, _text_w, ACTIVE, TEXT_ACTIVE
-    if not weights:
-        return
-    for key in _weights:
-        if key in weights and weights[key] is not None:
-            # 0 cuts a region off entirely (log 0 = -inf); "current" keeps a floor so every query has keys
-            _weights[key] = min(4.0, max(0.05 if key == "current" else 0.0, float(weights[key])))
-    vals = torch.tensor([_weights["sink"], _weights["recent"], _weights["current"]]).log()
-    if _log_w is None:
-        _log_w = vals.cuda()
-    else:
-        _log_w.copy_(vals)
-    if _text_w is None:
-        _text_w = torch.tensor([_weights["text"]]).cuda()
-    else:
-        _text_w.fill_(_weights["text"])
-    ACTIVE = any(_weights[k] != 1.0 for k in ("sink", "recent", "current"))
-    TEXT_ACTIVE = _weights["text"] != 1.0
+    """Live self-attention kernel switch (see BACKEND)."""
+    global BACKEND
+    name = (name or "default").lower()
+    BACKEND = name if name in ("default", "flash", "sage2first") else "default"
 
 
 def scale_cross(y):
@@ -88,8 +44,8 @@ def scale_cross(y):
 def steered_attention(q, k, v, sink_tokens: int):
     """q: [B, Lq, H, D]; k, v: [B, Lk, H, D] laid out as [sink | recent | current(last Lq)]."""
     if not ACTIVE:
-        if _sage2 is not None and (BACKEND == "sage2" or (BACKEND == "sage2first" and PASS_STEP == 0)):
-            return _sage2(q, k, v)
+        if BACKEND == "flash" or (BACKEND == "sage2first" and PASS_STEP != 0):
+            return flash_attention(q, k, v)
         return attention(q, k, v)
     lq, lk = q.shape[1], k.shape[1]
     # the chunk's own tokens take priority: on the first chunk after a reset everything is "current"
