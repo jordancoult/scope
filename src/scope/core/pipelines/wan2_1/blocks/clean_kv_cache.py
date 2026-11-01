@@ -72,6 +72,9 @@ class CleanKVCacheBlock(ModularPipelineBlocks):
             InputParam(
                 "width", required=True, type_hint=int, description="Width of video"
             ),
+            # Local patch (ai-character-scope): skip the extra clean-memory pass when denoising used 2+
+            # steps; the last step's nearly-clean input is kept as the memory instead. Off by default.
+            InputParam("skip_clean_kv", default=False, type_hint=bool),
             InputParam(
                 "conditioning_embeds",
                 required=True,
@@ -112,6 +115,11 @@ class CleanKVCacheBlock(ModularPipelineBlocks):
             update_bank = False
 
         generator_param = next(components.generator.parameters())
+
+        if block_state.skip_clean_kv and len(state.get("denoising_step_list") or []) >= 2 and not update_bank:
+            # (MemFlow still runs the pass on chunks that write its memory bank)
+            self.set_block_state(state, block_state)
+            return components, state
 
         _, num_frames, _, _, _ = block_state.latents.shape
         current_end_frame = block_state.current_start_frame + num_frames

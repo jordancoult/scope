@@ -128,6 +128,12 @@ class RewardForcingPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
                         parent = generator.model.get_submodule(parent_name) if parent_name else generator.model
                         setattr(parent, child, module.get_base_layer())
                         merged += 1
+                if os.environ.get("SCOPE_FP4_FFN"):
+                    # Experimental: NVFP4 FFN layers (from the merged bf16 weights, before fp8)
+                    from ..wan2_1.fp4_linear import convert_ffn_to_fp4
+
+                    nf = convert_ffn_to_fp4(generator.model, layers=(2,) if os.environ["SCOPE_FP4_FFN"] == "2" else (0, 2))
+                    logger.info(f"SCOPE_FP4_FFN: {nf} FFN linear layers -> NVFP4 (experimental)")
                 n = convert_blocks_to_fp8_rowwise(generator.model)
                 torch.cuda.empty_cache()
                 logger.info(f"SCOPE_FP8_ROWWISE: merged {merged} LoRA layers, {n} linear layers -> fp8 row-wise")
