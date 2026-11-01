@@ -20,6 +20,7 @@ from ..wan2_1.blocks import (
     TextConditioningBlock,
 )
 from ..wan2_1.vace.blocks import VaceEncodingBlock
+from ..streamdiffusionv2.depth_vace_block import DepthVaceBlock
 from .blocks import SetupMemoryBankBlock
 
 logger = diffusers_logging.get_logger(__name__)
@@ -36,6 +37,8 @@ ALL_BLOCKS = InsertableDict(
         ("setup_memory_bank", SetupMemoryBankBlock),
         ("setup_caches", SetupCachesBlock),
         ("auto_preprocess_video", AutoPreprocessVideoBlock),
+        # Local patch (ai-character-scope): optional depth maps -> vace_input_frames (body structure)
+        ("depth_vace", DepthVaceBlock),
         (
             "set_transformer_blocks_local_attn_size",
             SetTransformerBlocksLocalAttnSizeBlock,

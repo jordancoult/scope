@@ -15,6 +15,7 @@ from ..wan2_1.blocks import (
     TextConditioningBlock,
 )
 from ..wan2_1.vace.blocks import VaceEncodingBlock
+from ..streamdiffusionv2.depth_vace_block import DepthVaceBlock
 from .blocks import PrepareNextBlock
 
 logger = diffusers_logging.get_logger(__name__)
@@ -34,6 +35,8 @@ ALL_BLOCKS = InsertableDict(
             SetTransformerBlocksLocalAttnSizeBlock,
         ),
         ("auto_preprocess_video", AutoPreprocessVideoBlock),
+        # Local patch (ai-character-scope): optional depth maps -> vace_input_frames (body structure)
+        ("depth_vace", DepthVaceBlock),
         ("auto_prepare_latents", AutoPrepareLatentsBlock),
         ("vace_encoding", VaceEncodingBlock),
         ("denoise", DenoiseBlock),

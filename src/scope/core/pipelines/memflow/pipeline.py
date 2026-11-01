@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ from ..defaults import (
 from ..interface import Pipeline, Requirements
 from ..process import postprocess_chunk
 from ..utils import Quantization, load_model_config, validate_resolution
+from ..wan2_1.modules import attention_steer
 from ..wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
 from ..wan2_1.lora.mixin import LoRAEnabledPipeline
 from ..wan2_1.lora.strategies.module_targeted_lora import ModuleTargetedLoRAStrategy
@@ -136,6 +138,26 @@ class MemFlowPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             print(f"Quantized diffusion model to fp8 in {time.time() - start:.3f}s")
         else:
             generator = generator.to(device=device, dtype=dtype)
+            if os.environ.get("SCOPE_FP8_ROWWISE") == "1":
+                # Local patch (ai-character-scope): bake LongLive's built-in LoRA into the base
+                # weights, then convert to fp8 row-wise. bf16 base + unmerged rank-256 LoRA + VACE
+                # doesn't fit in 16 GB, and torchao's fp8 path fails on this model.
+                from peft.tuners.lora import LoraLayer
+
+                from ..wan2_1.fp8_rowwise import convert_blocks_to_fp8_rowwise
+
+                merged = 0
+                for name, module in list(generator.model.named_modules()):
+                    if isinstance(module, LoraLayer):
+                        module.merge()
+                        parent_name, _, child = name.rpartition(".")
+                        parent = generator.model.get_submodule(parent_name) if parent_name else generator.model
+                        setattr(parent, child, module.get_base_layer())
+                        merged += 1
+                n = convert_blocks_to_fp8_rowwise(generator.model)
+                torch.cuda.empty_cache()
+                logger.info(f"SCOPE_FP8_ROWWISE: merged {merged} LoRA layers, {n} linear layers -> fp8 row-wise")
+
 
         if stage_callback:
             stage_callback("Loading text encoder...")
@@ -183,6 +205,11 @@ class MemFlowPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         components.add("embedding_blender", embedding_blender)
 
         self.blocks = MemFlowBlocks()
+        # Local patch (ai-character-scope): preload the depth model (see streamdiffusionv2/pipeline.py)
+        if os.environ.get("SCOPE_PRELOAD_DEPTH") == "1" and getattr(config, "vace_path", None):
+            from ..video_depth_anything.gpu_depth import GpuStreamingDepth
+
+            self.blocks.sub_blocks["depth_vace"]._depth = GpuStreamingDepth(device=device)
         self.components = components
         self.state = PipelineState()
         # These need to be set right now because InputParam.default on the blocks
@@ -219,6 +246,12 @@ class MemFlowPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             if self.state.get("manage_cache", True):
                 kwargs["init_cache"] = True
 
+        # Local patch (ai-character-scope): live attention steering (see attention_steer.py)
+        if kwargs.get("attention_weights") is not None:
+            attention_steer.set_weights(kwargs["attention_weights"])
+        if kwargs.get("sink_frames") is not None:
+            attention_steer.set_sink_frames(self.components.generator.model, kwargs["sink_frames"])
+
         for k, v in kwargs.items():
             self.state.set(k, v)
 
@@ -233,6 +266,11 @@ class MemFlowPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         # Clear vace_ref_images from state if not provided to prevent encoding on chunks where they weren't sent
         if "vace_ref_images" not in kwargs:
             self.state.set("vace_ref_images", None)
+
+        # Local patch (ai-character-scope): clear stale VACE input frames/masks (as in longlive)
+        for key in ("vace_input_frames", "vace_input_masks"):
+            if key not in kwargs:
+                self.state.set(key, None)
 
         # Clear extension mode frame images from state if not provided to prevent reuse on non-extension chunks
         if "first_frame_image" not in kwargs:
