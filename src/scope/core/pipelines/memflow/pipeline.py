@@ -257,6 +257,8 @@ class MemFlowPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             attention_steer.set_weights(kwargs["attention_weights"])
         if kwargs.get("sink_frames") is not None:
             attention_steer.set_sink_frames(self.components.generator.model, kwargs["sink_frames"])
+        if "attention_backend" in kwargs:
+            attention_steer.set_backend(kwargs["attention_backend"])
 
         for k, v in kwargs.items():
             self.state.set(k, v)
