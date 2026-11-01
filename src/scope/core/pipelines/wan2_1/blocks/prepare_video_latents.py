@@ -67,6 +67,12 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
                 default=0.7,
                 description="Amount of noise added to video",
             ),
+            # Local patch (ai-character-scope): person hint. Inside person_mask (pixel-res
+            # [B, 1, T, H, W], from the depth block) the latents are pulled toward the camera
+            # latents by person_hint, elsewhere they stay as noisy as noise_scale says. With
+            # noise 1.0 this keeps the person's colours/identity while the scene is invented.
+            InputParam("person_mask", default=None, type_hint=torch.Tensor | None),
+            InputParam("person_hint", default=0.0, type_hint=float),
         ]
 
     @property
@@ -119,6 +125,13 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
         block_state.latents = noise * block_state.noise_scale + latents * (
             1 - block_state.noise_scale
         )
+        hint = float(block_state.person_hint or 0.0)
+        mask = block_state.person_mask
+        if hint > 0 and isinstance(mask, torch.Tensor):
+            b, f, _, lh, lw = latents.shape
+            m = torch.nn.functional.adaptive_avg_pool3d(mask.float(), (f, lh, lw))  # [B, 1, F, h, w]
+            m = (m.permute(0, 2, 1, 3, 4) * hint).to(latents.dtype)  # [B, F, 1, h, w]
+            block_state.latents = block_state.latents * (1 - m) + latents * m
         block_state.generator = rng
 
         self.set_block_state(state, block_state)
