@@ -140,6 +140,8 @@ def _register_pipelines():
             "RewardForcingPipeline",
         ),
         ("memflow", ".memflow.pipeline", "MemFlowPipeline"),
+        # Local port (ai-character-scope): LongLive 2.0 text-to-video
+        ("longlive2", ".longlive2.pipeline", "LongLive2Pipeline"),
         ("passthrough", ".passthrough.pipeline", "PassthroughPipeline"),
         (
             "video_depth_anything",

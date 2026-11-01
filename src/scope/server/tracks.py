@@ -363,13 +363,20 @@ class VideoProcessingTrack(MediaStreamTrack):
                     # When video is paused, return the last frame to freeze the playback video
                     frame = self._last_frame
                 else:
+                    _t0 = time.time()
                     packet = self.frame_processor.get_packet()
+                    _t1 = time.time()
 
                     if packet is not None:
                         packet = ensure_video_packet(packet)
                         frame = VideoFrame.from_ndarray(
                             packet.tensor.numpy(), format="rgb24"
                         )
+                    if os.environ.get("SCOPE_TRACK_STATS") == "1":
+                        st = self.__dict__.setdefault("_dbg2", {"get": 0.0, "conv": 0.0, "empty": 0})
+                        st["get"] += _t1 - _t0
+                        st["conv"] += time.time() - _t1
+                        st["empty"] += packet is None
 
                 if frame is not None:
                     if not self._first_frame_emitted:
@@ -389,6 +396,17 @@ class VideoProcessingTrack(MediaStreamTrack):
 
                     with self._frame_lock:
                         self._last_frame = frame
+                    if os.environ.get("SCOPE_TRACK_STATS") == "1":  # debug: frames actually sent per second
+                        st = self.__dict__.setdefault("_dbg", {"n": 0, "t": time.time()})
+                        st["n"] += 1
+                        if time.time() - st["t"] >= 5:
+                            d2 = self.__dict__.get("_dbg2", {"get": 0, "conv": 0, "empty": 0})
+                            logger.info(f"[track] get_packet {1000 * d2['get']:.0f} ms, convert {1000 * d2['conv']:.0f} ms, "
+                                        f"empty polls {d2['empty']} in last window")
+                            self.__dict__["_dbg2"] = {"get": 0.0, "conv": 0.0, "empty": 0}
+                            logger.info(f"[track] sent {st['n'] / (time.time() - st['t']):.1f} fps, pacing fps "
+                                        f"{self._ts['fps']:.1f}, queued {self.frame_processor.output_backlog() if hasattr(self.frame_processor, 'output_backlog') else '?'}")
+                            st["n"], st["t"] = 0, time.time()
                     return frame
 
                 # No frame available, wait a bit before trying again
