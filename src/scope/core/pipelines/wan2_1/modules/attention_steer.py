@@ -24,7 +24,8 @@ _log_w = None  # [3] float32 CUDA tensor; a tensor so torch.compile doesn't reco
 _text_w = None  # [1] float32 CUDA tensor
 ACTIVE = False
 TEXT_ACTIVE = False
-BACKEND = "flash"  # self-attention kernel when not steering: "flash" (stock, exact) or "sage2"
+BACKEND = "flash"  # self-attention kernel when not steering: "flash" (stock, exact), "sage2", "sage2first"
+PASS_STEP = -1  # current denoising step index (set by DenoiseBlock); -1 outside denoising
 _sage2 = None
 
 
@@ -34,7 +35,7 @@ def set_backend(name: str | None) -> None:
     would switch every pipeline to Sage) stays off. Falls back to flash if it can't load."""
     global BACKEND, _sage2
     name = (name or "flash").lower()
-    if name == "sage2" and _sage2 is None:
+    if name in ("sage2", "sage2first") and _sage2 is None:
         try:
             import os, sys
             path = os.path.expanduser(os.environ.get("SCOPE_SAGE2_PATH", "~/personal/ai-character-scope/longlive2/.sage2/pkg"))
@@ -55,7 +56,7 @@ def set_backend(name: str | None) -> None:
         except Exception as e:  # missing wheel / incompatible GPU: stay exact
             print(f"[attention] SageAttention 2 unavailable ({e}); using flash-attention", flush=True)
             name = "flash"
-    BACKEND = name if name in ("flash", "sage2") else "flash"
+    BACKEND = name if name in ("flash", "sage2", "sage2first") else "flash"
 
 
 def set_weights(weights: dict | None) -> None:
@@ -87,7 +88,7 @@ def scale_cross(y):
 def steered_attention(q, k, v, sink_tokens: int):
     """q: [B, Lq, H, D]; k, v: [B, Lk, H, D] laid out as [sink | recent | current(last Lq)]."""
     if not ACTIVE:
-        if BACKEND == "sage2" and _sage2 is not None:
+        if _sage2 is not None and (BACKEND == "sage2" or (BACKEND == "sage2first" and PASS_STEP == 0)):
             return _sage2(q, k, v)
         return attention(q, k, v)
     lq, lk = q.shape[1], k.shape[1]

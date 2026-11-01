@@ -196,7 +196,10 @@ class DenoiseBlock(ModularPipelineBlocks):
             denoising_step_list[0] = int(1000 * block_state.noise_scale) - NOISE_T_OFFSET
 
         # Denoising loop
+        from ..modules import attention_steer as _steer
+
         for index, current_timestep in enumerate(denoising_step_list):
+            _steer.PASS_STEP = index  # lets the attention backend act on the first step only
             if index == 0:
                 q_bank = True
             else:
@@ -307,6 +310,7 @@ class DenoiseBlock(ModularPipelineBlocks):
                     vace_context_scale=block_state.vace_context_scale,
                 )
 
+        _steer.PASS_STEP = -1  # clean-KV pass and later: not a denoising step
         block_state.latents = denoised_pred
         if FUSED_KV:
             self._fused_prev = (denoised_pred.detach(), start_frame)
