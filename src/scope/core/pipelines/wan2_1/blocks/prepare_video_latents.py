@@ -73,6 +73,16 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
             # noise 1.0 this keeps the person's colours/identity while the scene is invented.
             InputParam("person_mask", default=None, type_hint=torch.Tensor | None),
             InputParam("person_hint", default=0.0, type_hint=float),
+            # Local patch: output feedback. Start each chunk from a blend of the previous chunk's
+            # denoised output and the new camera latents (feedback = share of the previous output),
+            # so a 1-step model keeps refining its own result instead of restarting from the camera.
+            # feedback_mode "last" repeats the newest output latent frame, "chunk" reuses all of them,
+            # "extrapolate" continues the last chunk's motion trend (for driving / walking scenes).
+            InputParam("feedback", default=0.0, type_hint=float),
+            InputParam("feedback_mode", default="last", type_hint=str),
+            # how much of the last chunk's motion to carry forward in "extrapolate" mode (1 = all)
+            InputParam("feedback_motion", default=1.0, type_hint=float),
+            InputParam("init_cache", default=False, type_hint=bool),
         ]
 
     @property
@@ -122,7 +132,32 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
         # Determine how noisy the latents should be
         # Higher noise scale -> noiser latents, less of inputs preserved
         # Lower noise scale -> less noisy latents, more of inputs preserved
-        block_state.latents = noise * block_state.noise_scale + latents * (
+        base = latents
+        fb = float(block_state.feedback or 0.0)
+        prev = state.get("latents")  # still the previous chunk's denoised output at this point
+        have_prev = (not block_state.init_cache and isinstance(prev, torch.Tensor)
+                     and prev.shape[0] == latents.shape[0] and prev.shape[2:] == latents.shape[2:])
+        if fb > 0 and not have_prev:
+            # Nothing to feed back yet (first chunk / reset): start this chunk from the prompt alone
+            # (full noise), otherwise the low feedback noise lets the camera's real room through and
+            # feedback then preserves it. The bridge re-sends noise_scale on the next call.
+            block_state.noise_scale = 1.0
+            state.set("noise_scale", 1.0)
+        if fb > 0 and have_prev:
+            f = latents.shape[1]
+            if block_state.feedback_mode == "chunk" and prev.shape[1] == f:
+                prev = prev.to(latents.dtype)
+            elif block_state.feedback_mode == "extrapolate" and prev.shape[1] > 1:
+                # continue the motion: extend the last chunk's trend (last - first frame) forward
+                p = prev.to(torch.float32)
+                k = 1.0 if block_state.feedback_motion is None else float(block_state.feedback_motion)
+                v = (p[:, -1:] - p[:, :1]) / (p.shape[1] - 1) * k
+                steps = torch.arange(1, f + 1, device=p.device, dtype=p.dtype).view(1, f, 1, 1, 1)
+                prev = (p[:, -1:] + v * steps).to(latents.dtype)
+            else:
+                prev = prev[:, -1:].to(latents.dtype).expand(-1, f, -1, -1, -1)
+            base = prev * fb + latents * (1 - fb)
+        block_state.latents = noise * block_state.noise_scale + base * (
             1 - block_state.noise_scale
         )
         hint = float(block_state.person_hint or 0.0)
