@@ -67,6 +67,9 @@ class DepthVaceBlock(ModularPipelineBlocks):
             # Body-only depth: depth below this (normalized 0..1, 1 = nearest) becomes neutral gray,
             # VACE's "no information" value, so the model invents the background. 0 = off.
             InputParam("depth_cutoff", default=0.0, type_hint=float),
+            # Run the depth model on every Nth frame and hold it in between. 4 = once per latent
+            # frame (VACE folds 4 frames into one); 1 = every frame (smoothest, ~7 ms per extra frame).
+            InputParam("depth_stride", default=4, type_hint=int),
             # Adaptive body-only depth: keep this fraction of the nearest pixels (e.g. 0.35 for a
             # person at a desk) whatever the room depth is. Overrides depth_cutoff when > 0.
             InputParam("depth_keep", default=0.0, type_hint=float),
@@ -120,6 +123,7 @@ class DepthVaceBlock(ModularPipelineBlocks):
                 self._depth = GpuStreamingDepth(device=video.device)
             if block_state.init_cache:
                 self._depth.reset()
+            self._depth.stride = max(1, int(block_state.depth_stride or 4))
             frames = self._depth(video)
             c = float(block_state.depth_cutoff or 0.0)
             d = (frames[:, :1] + 1) / 2  # [B, 1, T, H, W] in 0..1, 1 = nearest
