@@ -19,11 +19,13 @@ _STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
 class GpuStreamingDepth:
-    def __init__(self, device="cuda", input_long_side=504, ema=0.9, frames_per_chunk=1):
+    def __init__(self, device="cuda", input_long_side=504, ema=0.9, stride=4):
         self.device = torch.device(device)
-        # VACE's encoder folds each 4-frame chunk into one latent frame, so depth for the newest
-        # frame repeated x4 is near-equivalent and 4x cheaper (VDA-S is launch-bound: ~7 ms/call).
-        self.frames_per_chunk = frames_per_chunk
+        # VACE's encoder folds each 4 frames into one latent frame, so depth for the last frame of
+        # each group of 4, repeated x4, is near-equivalent and 4x cheaper (VDA-S is launch-bound:
+        # ~7 ms/call). One depth per *chunk* is not enough: LongLive chunks are 12 frames (3 latent
+        # frames), and a single repeated depth map froze the pose for the whole chunk (jerky motion).
+        self.stride = stride
         self.input_long_side = input_long_side
         self.ema = ema
         model = VideoDepthAnything(**MODEL_CONFIG, metric=False)
@@ -46,8 +48,9 @@ class GpuStreamingDepth:
     def __call__(self, video: torch.Tensor) -> torch.Tensor:
         """video: [B=1, C=3, T, H, W] in [-1, 1]. Returns depth frames, same shape/range (near = bright)."""
         _, _, t_out, h, w = video.shape
-        if self.frames_per_chunk < t_out:
-            video = video[:, :, -self.frames_per_chunk:]
+        # newest frame of each group of `stride`, counted back from the end of the chunk
+        idx = list(range(t_out - 1, -1, -self.stride))[::-1]
+        video = video[:, :, idx]
         t = video.shape[2]
         frames = (video[0].permute(1, 0, 2, 3).float() + 1) / 2  # [T, 3, H, W] in [0, 1]
         ih, iw = self._input_size(h, w)
@@ -66,6 +69,7 @@ class GpuStreamingDepth:
             self.lo = self.ema * self.lo + (1 - self.ema) * lo
             self.hi = self.ema * self.hi + (1 - self.ema) * hi
         d = ((d - self.lo) / (self.hi - self.lo).clamp(min=1e-6)).clamp(0, 1)
-        if t < t_out:
-            d = torch.cat([d[:1].expand(t_out - t, -1, -1, -1), d])  # pad to chunk length
+        if t < t_out:  # each output frame takes the depth of the next sampled frame at or after it
+            src = torch.searchsorted(torch.tensor(idx), torch.arange(t_out)).to(d.device)
+            d = d[src]
         return (d * 2 - 1).repeat(1, 3, 1, 1).permute(1, 0, 2, 3).unsqueeze(0).to(video.dtype)
