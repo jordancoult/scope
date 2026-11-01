@@ -20,6 +20,38 @@ class DepthVaceBlock(ModularPipelineBlocks):
     def __init__(self):
         super().__init__()
         self._depth = None
+        self._seg = None
+
+    @torch.no_grad()
+    def _segment(self, video: torch.Tensor, placed: bool, fade_bottom: float = 0.12) -> torch.Tensor:
+        """[B, 3, T, H, W] in -1..1 -> soft person mask [B, 1, T, H, W] in 0..1."""
+        if self._seg is None:
+            from torchvision.models.segmentation import (
+                DeepLabV3_MobileNet_V3_Large_Weights,
+                deeplabv3_mobilenet_v3_large,
+            )
+
+            w = DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
+            self._seg = deeplabv3_mobilenet_v3_large(weights=w).to(video.device).eval().half()
+        b, c, t, h, w = video.shape
+        step = 3 if t >= 6 else 1  # segment every 3rd frame; the person moves little in 0.1 s
+        idx = torch.arange(0, t, step, device=video.device)
+        x = video[:, :, idx].permute(0, 2, 1, 3, 4).reshape(-1, c, h, w).float()
+        x = (x + 1) / 2
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        p = self._seg(((x - mean) / std).half())["out"].float().softmax(1)[:, 15:16]  # VOC "person"
+        p = F.avg_pool2d(p, 9, stride=1, padding=4)  # feather the outline
+        p = p.reshape(b, len(idx), 1, h, w).permute(0, 2, 1, 3, 4)
+        p = p.repeat_interleave(step, dim=2)[:, :, :t]
+        if placed:  # fade to zero over the outer ~12% so nothing touches the placed rectangle's edge
+            ys = torch.linspace(0, 1, h, device=p.device)
+            xs = torch.linspace(0, 1, w, device=p.device)
+            fy = torch.minimum((ys / 0.12).clamp(0, 1), ((1 - ys) / max(fade_bottom, 1e-3)).clamp(0, 1))
+            fx = ((torch.minimum(xs, 1 - xs)) / 0.12).clamp(0, 1)
+            win = (fy[:, None] * fx[None, :]) ** 0.5
+            p = p * win
+        return p
 
     @property
     def description(self) -> str:
@@ -45,6 +77,17 @@ class DepthVaceBlock(ModularPipelineBlocks):
             InputParam("place_x", default=0.5, type_hint=float),
             InputParam("place_y", default=0.6, type_hint=float),
             InputParam("person_mask", default=None, type_hint=torch.Tensor | None),
+            # Cut out the person with a segmentation model (DeepLabV3-MobileNet, ~2 ms/frame)
+            # instead of a depth threshold: no room patches, feathered outline, and when placed
+            # everything fades out before the edge of the placed rectangle (no visible box).
+            InputParam("person_seg", default=False, type_hint=bool),
+            # bottom fade of the placed cut-out (0 = the torso runs to the bottom edge, like a body
+            # continuing below the frame; fading it turns the person into a floating bust)
+            InputParam("place_fade_bottom", default=0.12, type_hint=float),
+            # virtual ground: when placed, the surroundings get a smooth full-frame depth gradient
+            # (far at the top, nearer at the bottom) and the person sits in it at mid distance, which
+            # gives the model a sense of scale without any edges
+            InputParam("place_ground", default=False, type_hint=bool),
         ]
 
     @property
@@ -85,7 +128,14 @@ class DepthVaceBlock(ModularPipelineBlocks):
                 c = float(torch.quantile(d.float().flatten()[::7], 1 - keep)) + 0.06  # edge sits at the quantile
             # person mask for the latent hint: the body-only cutoff if set, else the nearest ~40%
             w = ((d - ((c or 0.45) - 0.06)) / 0.12).clamp(0, 1)
-            if c > 0:
+            if block_state.person_seg:
+                fb = block_state.place_fade_bottom
+                seg = self._segment(video, float(block_state.place_scale or 1.0) < 0.999, 0.12 if fb is None else float(fb))
+                if seg.shape[2] != frames.shape[2]:  # depth pads short chunks at the front
+                    seg = torch.cat([seg[:, :, :1].expand(-1, -1, frames.shape[2] - seg.shape[2], -1, -1), seg], 2)
+                w = seg.to(frames.dtype)
+                frames = frames * w  # everything but the person -> 0 (gray = unknown to VACE)
+            elif c > 0:
                 frames = frames * w  # background -> 0 (gray = unknown to VACE)
             block_state.vace_input_frames = frames
             block_state.person_mask = w
@@ -98,6 +148,15 @@ class DepthVaceBlock(ModularPipelineBlocks):
                 block_state.vace_input_frames = self._place(block_state.vace_input_frames, scale, cx, cy)
             if isinstance(block_state.person_mask, torch.Tensor):
                 block_state.person_mask = self._place(block_state.person_mask, scale, cx, cy)
+            if block_state.place_ground and block_state.depth_vace and isinstance(block_state.person_mask, torch.Tensor):
+                vf = block_state.vace_input_frames
+                pm = block_state.person_mask.to(vf.dtype)
+                if pm.shape[2] != vf.shape[2]:
+                    pm = torch.cat([pm[:, :, :1].expand(-1, -1, vf.shape[2] - pm.shape[2], -1, -1), pm], 2)
+                h = vf.shape[-2]
+                grad = torch.linspace(0.05, 0.5, h, device=vf.device, dtype=vf.dtype).view(1, 1, 1, h, 1)
+                person = 0.5 + 0.25 * (vf + 1) / 2
+                block_state.vace_input_frames = (grad * (1 - pm) + person * pm) * 2 - 1
             block_state.video = self._place(video, scale, cx, cy)
         self.set_block_state(state, block_state)
         return components, state
