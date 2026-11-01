@@ -143,6 +143,11 @@ class DepthVaceBlock(ModularPipelineBlocks):
                 frames = frames * w  # background -> 0 (gray = unknown to VACE)
             block_state.vace_input_frames = frames
             block_state.person_mask = w
+        elif block_state.person_seg and isinstance(video, torch.Tensor):
+            # Cut-out without depth: only the person mask (for the identity hint); VACE gets nothing
+            fb = block_state.place_fade_bottom
+            block_state.person_mask = self._segment(
+                video, float(block_state.place_scale or 1.0) < 0.999, 0.12 if fb is None else float(fb)).to(video.dtype)
         scale = float(block_state.place_scale or 1.0)
         if 0 < scale < 0.999 and isinstance(video, torch.Tensor):
             cx, cy = float(block_state.place_x), float(block_state.place_y)
