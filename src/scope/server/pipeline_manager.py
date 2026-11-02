@@ -1045,7 +1045,9 @@ class PipelineManager:
                     "generator_path": str(
                         get_model_file_path("LongLive-1.3B/models/longlive_base.pt")
                     ),
-                    "lora_path": str(
+                    # Local patch (ai-character-scope): SCOPE_LONGLIVE_LORA swaps the LongLive LoRA
+                    # (e.g. OPSD-V's post-trained one); default is the stock lora.pt.
+                    "lora_path": __import__("os").environ.get("SCOPE_LONGLIVE_LORA") or str(
                         get_model_file_path("LongLive-1.3B/models/lora.pt")
                     ),
                     "text_encoder_path": str(
