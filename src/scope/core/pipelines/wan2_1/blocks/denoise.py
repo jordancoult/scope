@@ -122,6 +122,9 @@ class DenoiseBlock(ModularPipelineBlocks):
                 type_hint=torch.Tensor | None,
                 description="VACE context that provides visual conditioning",
             ),
+            # Local patch (ai-character-scope): with SCOPE_FUSED_KV, refresh the previous chunk's
+            # memory only on every Nth chunk (same rule as CleanKVCacheBlock; 1 = every chunk)
+            InputParam("clean_kv_every", default=1, type_hint=int),
             InputParam(
                 "vace_context_scale",
                 default=1.0,
@@ -178,9 +181,22 @@ class DenoiseBlock(ModularPipelineBlocks):
                 prev_x0, prev_start = prev
                 from scope.core.pipelines.streamdiffusionv2.modules.causal_model import _kv_index
 
-                cache_end = _kv_index(block_state.kv_cache[0], "global_end_index")
+                kv0 = block_state.kv_cache[0]
+                # StreamDiffusionV2 keeps a host mirror of the index (no GPU sync); the LongLive
+                # family updates it in place with fill_, so read the tensor there.
+                cache_end = (
+                    _kv_index(kv0, "global_end_index")
+                    if "_host_global_end_index" in kv0
+                    else int(kv0["global_end_index"].item())
+                )
+                # (Reward Forcing's first video chunk advances one frame less than it holds, so the
+                # next chunk overlaps it; that chunk gets a real clean pass instead, see
+                # CleanKVCacheBlock, and is not fused here.)
+                every = int(getattr(block_state, "clean_kv_every", 1) or 1)
+                prev_chunk = prev_start // max(1, prev_x0.shape[1])
                 if (
-                    prev_start + prev_x0.shape[1] == start_frame
+                    (every <= 1 or len(denoising_step_list) < 2 or prev_chunk % every == 0)
+                    and prev_start + prev_x0.shape[1] == start_frame
                     and cache_end == start_frame * frame_seq_length
                     and prev_x0.shape[0] == batch_size
                     and prev_x0.shape[2:] == noise.shape[2:]

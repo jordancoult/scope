@@ -26,6 +26,14 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
+# Local patch (ai-character-scope): keep cached keys already RoPE-rotated at their absolute frame
+# position ("kr" buffer) instead of re-rotating the whole window in float64 in every layer and pass.
+# RoPE scores depend only on relative position, so this matches the stock math (bf16 rounding
+# aside); only the sink frames are re-rotated per call. Used when the window covers the cache.
+import os as _os
+ROPE_CACHE = _os.environ.get("SCOPE_RF_ROPE_CACHE") == "1"
+
+
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
@@ -39,7 +47,10 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        # Local patch (ai-character-scope): float32 instead of float64 with ROPE_CACHE (fp64 runs
+        # at 1/64 rate on GeForce; the result is rounded to bf16 anyway).
+        ftype = torch.float32 if ROPE_CACHE else torch.float64
+        x_i = torch.view_as_complex(x[i, :seq_len].to(ftype).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -47,6 +58,8 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
             dim=-1).reshape(seq_len, 1, -1)
+        if ROPE_CACHE:
+            freqs_i = freqs_i.to(torch.complex64)
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
@@ -200,12 +213,129 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = q.shape[1]
 
+            # Local patch (ai-character-scope): attention for a slice of queries whose keys end at
+            # end_index (lets the fused clean-KV prefix attend without seeing the new chunk).
+            def _attend(qq, end_index, cache_k=None, cache_v=None):
+                cache_k = kv_cache["k"] if cache_k is None else cache_k
+                cache_v = kv_cache["v"] if cache_v is None else cache_v
+                grid_sizes_q = grid_sizes.clone()
+                grid_sizes_q[:, 0] = qq.shape[1] // frame_seqlen
+                # Prepare key and value tensors for attention
+                kv_start_index = max(total_sink_tokens, end_index - self.max_attention_size + total_sink_tokens)
+                kv_end_index = end_index
+
+                # Calculate the actual number of tokens to use
+                actual_kv_tokens = kv_end_index - kv_start_index
+
+                # Ensure we have valid dimensions for RoPE application
+                k_segment = cache_k[:, kv_start_index:kv_end_index]
+                v_segment = cache_v[:, kv_start_index:kv_end_index]
+
+                # Fix for sink_size > 1: use all sink tokens, not just a random one
+                if self.sink_size > 0:
+                    sink_k = cache_k[:, :total_sink_tokens]
+                    sink_v = cache_v[:, :total_sink_tokens]
+
+                    k_combined = torch.cat([sink_k, k_segment], dim=1)
+                    v_combined = torch.cat([sink_v, v_segment], dim=1)
+
+                    # Update grid_sizes_kv to reflect the correct frame count
+                    grid_sizes_kv = copy.deepcopy(grid_sizes)
+                    total_combined_tokens = total_sink_tokens + actual_kv_tokens
+                    total_frames = total_combined_tokens // frame_seqlen
+                    grid_sizes_kv[:, 0] = total_frames
+
+                    # Calculate start frame for query RoPE
+                    query_start_frame = (total_sink_tokens +
+                                       (end_index - max(total_sink_tokens, end_index - self.max_attention_size + total_sink_tokens)) -
+                                       qq.shape[1]) // frame_seqlen
+
+                    return attention(
+                        causal_rope_apply(
+                            qq, grid_sizes_q, freqs, start_frame=query_start_frame
+                        ).type_as(v),
+                        causal_rope_apply(
+                            k_combined, grid_sizes_kv, freqs, start_frame=0
+                        ).type_as(v),
+                        v_combined,
+                    )
+                else:
+                    # No sink tokens case
+                    grid_sizes_kv = copy.deepcopy(grid_sizes)
+                    grid_sizes_kv[:, 0] = actual_kv_tokens // frame_seqlen
+
+                    query_start_frame = (end_index - self.max_attention_size - qq.shape[1]) // frame_seqlen
+
+                    return attention(
+                        causal_rope_apply(
+                            qq, grid_sizes_q, freqs, start_frame=query_start_frame
+                        ).type_as(v),
+                        causal_rope_apply(
+                            k_segment, grid_sizes_kv, freqs, start_frame=0
+                        ).type_as(v),
+                        v_segment,
+                    )
+
+
+
+            # Local patch (ai-character-scope): fused clean-KV refresh; the cache grows only by the
+            # new chunk when the first FUSED_PREFIX_TOKENS re-write the previous chunk at t=0.
+            from scope.core.pipelines.streamdiffusionv2.modules import causal_model as _fcm
+
+            fused_prefix = _fcm.FUSED_PREFIX_TOKENS
+            num_growth_tokens = current_end - kv_cache["global_end_index"].item()
+            x_prefix = None
+            fast = (ROPE_CACHE and self.sink_size > 0
+                    and self.max_attention_size >= kv_cache_size)  # window = sink + whole cache
+            if fast:
+                old_ge = kv_cache["global_end_index"].item()
+                old_le = kv_cache["local_end_index"].item()
+                kr = kv_cache.get("kr")
+                if kr is None or kr.shape != kv_cache["k"].shape:
+                    kr = kv_cache["kr"] = torch.zeros_like(kv_cache["k"])
+                    kv_cache["_kr_base"] = 0
+                if old_ge == 0:
+                    kv_cache["_kr_base"] = 0  # fresh stream / cache reset
+
+                def _rope(x_, start):
+                    g = grid_sizes.clone()
+                    g[:, 0] = x_.shape[1] // frame_seqlen
+                    return causal_rope_apply(x_, g, freqs, start_frame=start).type_as(v)
+
+                if current_end // frame_seqlen - kv_cache["_kr_base"] > 1000:  # freqs table is 1024
+                    new_base = (old_ge - old_le) // frame_seqlen  # global frame of slot 0
+                    if old_le > 0:
+                        kr[:, :old_le] = _rope(kv_cache["k"][:, :old_le], 0)
+                    kv_cache["_kr_base"] = new_base
+                base = kv_cache["_kr_base"]
+                rk = _rope(k, current_start_frame - base)
+                rq = _rope(q, current_start_frame - base)
+            if fast and 0 < fused_prefix < num_new_tokens:
+                # Same as below, without RoPE re-rotation: write the prefix into its existing slots
+                # (re-written after the roll anyway) and attend before anything is evicted.
+                prefix_slot = old_le - (old_ge - current_start)
+                pe = prefix_slot + fused_prefix
+                kv_cache["k"][:, prefix_slot:pe] = k[:, :fused_prefix]
+                kv_cache["v"][:, prefix_slot:pe] = v[:, :fused_prefix]
+                kr[:, prefix_slot:pe] = rk[:, :fused_prefix]
+                kr[:, :total_sink_tokens] = _rope(kv_cache["k"][:, :total_sink_tokens],
+                                                  (old_ge - old_le) // frame_seqlen - base)
+                x_prefix = attention(rq[:, :fused_prefix], kr[:, :pe], kv_cache["v"][:, :pe])
+            elif 0 < fused_prefix < num_new_tokens:
+                # Prefix (previous chunk at t=0) attends to the cache as it was before this call
+                # evicts anything, as a separate clean pass would have.
+                old_local_end = kv_cache["local_end_index"].item()
+                prefix_slot = old_local_end - (kv_cache["global_end_index"].item() - current_start)
+                pk = torch.cat([kv_cache["k"][:, :prefix_slot], k[:, :fused_prefix]], dim=1)
+                pv = torch.cat([kv_cache["v"][:, :prefix_slot], v[:, :fused_prefix]], dim=1)
+                x_prefix = _attend(q[:, :fused_prefix], prefix_slot + fused_prefix, pk, pv)
+
             evicted_tokens_exist = False
             evicted_k = None
             evicted_v = None
 
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+            if self.local_attn_size != -1 and (num_growth_tokens > 0) and (num_growth_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+                num_evicted_tokens = num_growth_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                 num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - total_sink_tokens
 
                 evicted_start = total_sink_tokens
@@ -218,12 +348,17 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, total_sink_tokens + num_evicted_tokens:total_sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 kv_cache["v"][:, total_sink_tokens:total_sink_tokens + num_rolled_tokens] = \
                     kv_cache["v"][:, total_sink_tokens + num_evicted_tokens:total_sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                if fast:
+                    kr[:, total_sink_tokens:total_sink_tokens + num_rolled_tokens] = \
+                        kr[:, total_sink_tokens + num_evicted_tokens:total_sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
 
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+                if fast:
+                    kr[:, local_start_index:local_end_index] = rk
             else:
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
@@ -231,6 +366,8 @@ class CausalWanSelfAttention(nn.Module):
                 # print(local_start_index, local_end_index)
                 kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+                if fast:
+                    kr[:, local_start_index:local_end_index] = rk
 
             if evicted_tokens_exist and evicted_k is not None and evicted_k.shape[1] > 0:
                 if evicted_k.shape[1] == total_sink_tokens:
@@ -249,61 +386,17 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, :min_len] = evicted_k[:, :min_len]
                     kv_cache["v"][:, :min_len] = evicted_v[:, :min_len]
 
-            # Prepare key and value tensors for attention
-            kv_start_index = max(total_sink_tokens, local_end_index - self.max_attention_size + total_sink_tokens)
-            kv_end_index = local_end_index
-
-            # Calculate the actual number of tokens to use
-            actual_kv_tokens = kv_end_index - kv_start_index
-
-            # Ensure we have valid dimensions for RoPE application
-            k_segment = kv_cache["k"][:, kv_start_index:kv_end_index]
-            v_segment = kv_cache["v"][:, kv_start_index:kv_end_index]
-
-            # Fix for sink_size > 1: use all sink tokens, not just a random one
-            if self.sink_size > 0:
-                sink_k = kv_cache["k"][:, :total_sink_tokens]
-                sink_v = kv_cache["v"][:, :total_sink_tokens]
-
-                k_combined = torch.cat([sink_k, k_segment], dim=1)
-                v_combined = torch.cat([sink_v, v_segment], dim=1)
-
-                # Update grid_sizes_kv to reflect the correct frame count
-                grid_sizes_kv = copy.deepcopy(grid_sizes)
-                total_combined_tokens = total_sink_tokens + actual_kv_tokens
-                total_frames = total_combined_tokens // frame_seqlen
-                grid_sizes_kv[:, 0] = total_frames
-
-                # Calculate start frame for query RoPE
-                query_start_frame = (total_sink_tokens +
-                                   (local_end_index - max(total_sink_tokens, local_end_index - self.max_attention_size + total_sink_tokens)) -
-                                   q.shape[1]) // frame_seqlen
-
-                x = attention(
-                    causal_rope_apply(
-                        q, grid_sizes, freqs, start_frame=query_start_frame
-                    ).type_as(v),
-                    causal_rope_apply(
-                        k_combined, grid_sizes_kv, freqs, start_frame=0
-                    ).type_as(v),
-                    v_combined,
-                )
+            if fast:
+                kr[:, :total_sink_tokens] = _rope(kv_cache["k"][:, :total_sink_tokens],
+                                                  (current_end - local_end_index) // frame_seqlen - base)
+                qn = rq if x_prefix is None else rq[:, fused_prefix:]
+                x = attention(qn, kr[:, :local_end_index], kv_cache["v"][:, :local_end_index])
+                if x_prefix is not None:
+                    x = torch.cat([x_prefix, x], dim=1)
+            elif x_prefix is not None:
+                x = torch.cat([x_prefix, _attend(q[:, fused_prefix:], local_end_index)], dim=1)
             else:
-                # No sink tokens case
-                grid_sizes_kv = copy.deepcopy(grid_sizes)
-                grid_sizes_kv[:, 0] = actual_kv_tokens // frame_seqlen
-
-                query_start_frame = (local_end_index - self.max_attention_size - q.shape[1]) // frame_seqlen
-
-                x = attention(
-                    causal_rope_apply(
-                        q, grid_sizes, freqs, start_frame=query_start_frame
-                    ).type_as(v),
-                    causal_rope_apply(
-                        k_segment, grid_sizes_kv, freqs, start_frame=0
-                    ).type_as(v),
-                    v_segment,
-                )
+                x = _attend(q, local_end_index)
 
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)

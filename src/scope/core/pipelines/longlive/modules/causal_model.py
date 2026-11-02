@@ -268,17 +268,24 @@ class CausalWanSelfAttention(nn.Module):
             is_recompute = (
                 current_end <= kv_cache["global_end_index"].item() and current_start > 0
             )
+            # Local patch (ai-character-scope): fused clean-KV refresh. The first `fused_prefix`
+            # tokens are the previous chunk at t=0 re-written over its cached slots, so the cache
+            # grows only by the new chunk (num_growth_tokens), not by the whole call.
+            from scope.core.pipelines.streamdiffusionv2.modules import causal_model as _fcm
+
+            fused_prefix = _fcm.FUSED_PREFIX_TOKENS
+            num_growth_tokens = current_end - kv_cache["global_end_index"].item()
             if (
                 self.local_attn_size != -1
-                and (current_end > kv_cache["global_end_index"].item())
+                and (num_growth_tokens > 0)
                 and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size
+                    num_growth_tokens + kv_cache["local_end_index"].item() > kv_cache_size
                 )
             ):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
                 num_evicted_tokens = (
-                    num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                    num_growth_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                 )
                 num_rolled_tokens = (
                     kv_cache["local_end_index"].item()
@@ -393,32 +400,52 @@ class CausalWanSelfAttention(nn.Module):
                 }
 
             # Use temporary k, v to compute attention
-            if sink_tokens > 0:
-                # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
-                v_sink = temp_v[:, :sink_tokens]
+            def _attend(query, end_index, temp_k=temp_k, temp_v=temp_v):
+                if sink_tokens > 0:
+                    # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
+                    local_budget = self.max_attention_size - sink_tokens
+                    k_sink = temp_k[:, :sink_tokens]
+                    v_sink = temp_v[:, :sink_tokens]
 
-                if local_budget > 0:
-                    local_start_for_window = max(
-                        sink_tokens, local_end_index - local_budget
-                    )
-                    k_local = temp_k[:, local_start_for_window:local_end_index]
-                    v_local = temp_v[:, local_start_for_window:local_end_index]
-                    k_cat = torch.cat([k_sink, k_local], dim=1)
-                    v_cat = torch.cat([v_sink, v_local], dim=1)
-                else:
-                    k_cat = k_sink
-                    v_cat = v_sink
-                x = steered_attention(roped_query, k_cat, v_cat, sink_tokens)
-            else:
-                window_start = max(0, local_end_index - self.max_attention_size)
-                x = steered_attention(
-                    roped_query,
-                    temp_k[:, window_start:local_end_index],
-                    temp_v[:, window_start:local_end_index],
+                    if local_budget > 0:
+                        local_start_for_window = max(
+                            sink_tokens, end_index - local_budget
+                        )
+                        k_local = temp_k[:, local_start_for_window:end_index]
+                        v_local = temp_v[:, local_start_for_window:end_index]
+                        k_cat = torch.cat([k_sink, k_local], dim=1)
+                        v_cat = torch.cat([v_sink, v_local], dim=1)
+                    else:
+                        k_cat = k_sink
+                        v_cat = v_sink
+                    return steered_attention(query, k_cat, v_cat, sink_tokens)
+                window_start = max(0, end_index - self.max_attention_size)
+                return steered_attention(
+                    query,
+                    temp_k[:, window_start:end_index],
+                    temp_v[:, window_start:end_index],
                     0,
                 )
+
+            if 0 < fused_prefix < num_new_tokens:
+                # The prefix (previous chunk, t=0) must not see the new chunk: same keys it would
+                # have seen in a separate clean-KV pass.
+                # Attend against the cache as it was *before* this call evicted anything (what a
+                # separate clean pass would have seen): its slots up to the previous chunk's start,
+                # then the prefix's own keys.
+                old_local_end = kv_cache["local_end_index"].item()
+                prefix_slot = old_local_end - (kv_cache["global_end_index"].item() - current_start)
+                pk = torch.cat([kv_cache["k"][:, :prefix_slot], roped_key[:, :fused_prefix]], dim=1)
+                pv = torch.cat([kv_cache["v"][:, :prefix_slot], v[:, :fused_prefix]], dim=1)
+                x = torch.cat(
+                    [
+                        _attend(roped_query[:, :fused_prefix], prefix_slot + fused_prefix, pk, pv),
+                        _attend(roped_query[:, fused_prefix:], local_end_index),
+                    ],
+                    dim=1,
+                )
+            else:
+                x = _attend(roped_query, local_end_index)
 
         # output
         x = x.flatten(2)

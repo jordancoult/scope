@@ -95,7 +95,12 @@ class CleanKVCacheBlock(ModularPipelineBlocks):
         # Local patch (ai-character-scope): with SCOPE_FUSED_KV=1 the clean-KV refresh happens
         # inside the next chunk's denoising forward (see DenoiseBlock), so skip it here.
         # SCOPE_SKIP_CLEAN_KV=1 skips it entirely (faster, visibly worse; experiment only).
-        if os.environ.get("SCOPE_FUSED_KV") == "1" or os.environ.get("SCOPE_SKIP_CLEAN_KV") == "1":
+        # The first chunk of a video stream still gets a real pass: Reward Forcing's next chunk
+        # overlaps it by a frame, so it can't be fused (one extra pass per stream start).
+        first_video_chunk = state.get("video") is not None and block_state.current_start_frame == 0
+        if os.environ.get("SCOPE_SKIP_CLEAN_KV") == "1" or (
+            os.environ.get("SCOPE_FUSED_KV") == "1" and not first_video_chunk
+        ):
             self.set_block_state(state, block_state)
             return components, state
 
