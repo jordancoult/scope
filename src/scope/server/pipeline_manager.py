@@ -1182,7 +1182,9 @@ class PipelineManager:
             config = OmegaConf.create(
                 {
                     "model_dir": str(get_models_dir()),
-                    "generator_path": str(
+                    # Local patch (ai-character-scope): SCOPE_RF_GENERATOR swaps the weights (e.g. a
+                    # Causal Forcing checkpoint, same Self-Forcing architecture); default unchanged.
+                    "generator_path": __import__("os").environ.get("SCOPE_RF_GENERATOR") or str(
                         get_model_file_path("Reward-Forcing-T2V-1.3B/rewardforcing.pt")
                     ),
                     "text_encoder_path": str(

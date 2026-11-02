@@ -52,6 +52,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             if generator_model_name is not None:
                 state_dict = state_dict[generator_model_name]
 
+            # Local patch (ai-character-scope): drop FSDP wrapper names (e.g. Causal Forcing++ checkpoints)
+            if any("_fsdp_wrapped_module." in k for k in state_dict.keys()):
+                state_dict = {k.replace("_fsdp_wrapped_module.", ""): v for k, v in state_dict.items()}
+
             # Remove 'model.' prefix if present (from wrapped models)
             if all(k.startswith("model.") for k in state_dict.keys()):
                 state_dict = {

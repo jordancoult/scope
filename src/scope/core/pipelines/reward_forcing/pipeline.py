@@ -54,6 +54,11 @@ class RewardForcingPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         tokenizer_path = getattr(config, "tokenizer_path", None)
 
         model_config = load_model_config(config, __file__)
+        # Local patch (ai-character-scope): overrides for swapped-in Self-Forcing-family checkpoints
+        if os.environ.get("SCOPE_RF_GENERATOR_KEY"):  # e.g. "generator_ema" for Causal Forcing checkpoints
+            model_config.generator_model_name = os.environ["SCOPE_RF_GENERATOR_KEY"]
+        if os.environ.get("SCOPE_RF_FRAMES_PER_BLOCK"):  # 1 = frame-wise models (Causal Forcing++)
+            model_config.num_frame_per_block = int(os.environ["SCOPE_RF_FRAMES_PER_BLOCK"])
 
         validate_resolution(
             height=config.height,
@@ -75,6 +80,7 @@ class RewardForcingPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             model_name=base_model_name,
             model_dir=model_dir,
             generator_path=generator_path,
+            generator_model_name=getattr(model_config, "generator_model_name", None),
             **base_model_kwargs,
         )
 
