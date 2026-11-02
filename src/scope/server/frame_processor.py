@@ -463,7 +463,22 @@ class FrameProcessor:
         shape = tuple(frame_array.shape)
         pinned_buffer = self._thread_local_pinned_buffer(shape)
         pinned_buffer.copy_(torch.as_tensor(frame_array, dtype=torch.uint8))
-        return pinned_buffer.cuda(non_blocking=False)
+        # Local patch (ai-character-scope): upload on a per-thread side stream. On the default stream the copy
+        # queues behind the pipeline's in-flight DiT work, blocking the WebRTC event loop for up to a whole
+        # chunk per input frame (output stutter). Wait only for this copy; tell the allocator the default
+        # stream uses the tensor afterwards.
+        tls = self._upload_tls if hasattr(self, "_upload_tls") else None
+        if tls is None:
+            import threading as _th
+            tls = self._upload_tls = _th.local()
+        stream = getattr(tls, "stream", None)
+        if stream is None:
+            stream = tls.stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            t = pinned_buffer.cuda(non_blocking=True)
+        stream.synchronize()
+        t.record_stream(torch.cuda.current_stream())
+        return t
 
     def _frame_array_to_tensor(self, frame_array) -> torch.Tensor:
         """Convert a numpy frame array to a batched tensor (CPU or GPU)."""

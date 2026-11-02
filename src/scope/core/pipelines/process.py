@@ -95,6 +95,15 @@ def preprocess_chunk(
     return chunk / 255.0 * 2.0 - 1.0
 
 
+def to_cpu_uint8(frames: torch.Tensor) -> torch.Tensor:
+    """Local patch (ai-character-scope): THWC [0, 1] float -> CPU uint8, one copy per chunk. Scope's output
+    track otherwise copies each GPU frame to the CPU separately, and every copy waits behind the next
+    chunk's queued GPU work (LongLive 2.0 output fell to 2-4 fps from this; LongLive 1 stutters)."""
+    if not frames.is_cuda:
+        return frames
+    return (frames * 255.0).round_().clamp_(0, 255).to(torch.uint8).cpu()
+
+
 def postprocess_chunk(chunk: torch.Tensor) -> torch.Tensor:
     # chunk is a BTCHW tensor
     # Drop the batch dim

@@ -27,6 +27,8 @@ TEXT_ACTIVE = False
 BACKEND = "default"  # "default" = Scope's attention() (SageAttention when installed, as always),
 # "flash" = exact flash-attention, "sage2first" = default on the first denoising step, exact flash after
 PASS_STEP = -1  # current denoising step index (set by DenoiseBlock); -1 outside denoising
+VACE_REUSE = False  # reuse step-1 VACE hints for later denoising steps (approximation; saves the VACE blocks)
+_vace_cache = None  # (key, hints)
 
 
 def set_backend(name: str | None) -> None:
@@ -34,6 +36,27 @@ def set_backend(name: str | None) -> None:
     global BACKEND
     name = (name or "default").lower()
     BACKEND = name if name in ("default", "flash", "sage2first") else "default"
+
+
+def set_weights(weights: dict | None) -> None:
+    global _log_w, _text_w, ACTIVE, TEXT_ACTIVE
+    if not weights:
+        return
+    for key in _weights:
+        if key in weights and weights[key] is not None:
+            # 0 cuts a region off entirely (log 0 = -inf); "current" keeps a floor so every query has keys
+            _weights[key] = min(4.0, max(0.05 if key == "current" else 0.0, float(weights[key])))
+    vals = torch.tensor([_weights["sink"], _weights["recent"], _weights["current"]]).log()
+    if _log_w is None:
+        _log_w = vals.cuda()
+    else:
+        _log_w.copy_(vals)
+    if _text_w is None:
+        _text_w = torch.tensor([_weights["text"]]).cuda()
+    else:
+        _text_w.fill_(_weights["text"])
+    ACTIVE = any(_weights[k] != 1.0 for k in ("sink", "recent", "current"))
+    TEXT_ACTIVE = _weights["text"] != 1.0
 
 
 def scale_cross(y):

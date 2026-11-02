@@ -448,19 +448,27 @@ class CausalVaceWanModel(nn.Module):
                 vlens = seq_lens - prefix
                 vgrid = grid_sizes.clone()
                 vgrid[:, 0] -= prefix_frames
-            hints = self.forward_vace(
-                vx,
-                vace_context,
-                seq_len,
-                ve0,
-                vlens,
-                vgrid,
-                self.causal_wan_model.freqs,
-                context,
-                context_lens,
-                self.causal_wan_model.block_mask,
-                crossattn_cache,
-            )
+            from scope.core.pipelines.wan2_1.modules import attention_steer as _st
+
+            key = (id(vace_context), tuple(vx.shape))
+            if _st.VACE_REUSE and _st.PASS_STEP > 0 and _st._vace_cache is not None and _st._vace_cache[0] == key:
+                hints = _st._vace_cache[1]  # Local patch: step-1 hints reused (VACE blocks skipped)
+            else:
+                hints = self.forward_vace(
+                    vx,
+                    vace_context,
+                    seq_len,
+                    ve0,
+                    vlens,
+                    vgrid,
+                    self.causal_wan_model.freqs,
+                    context,
+                    context_lens,
+                    self.causal_wan_model.block_mask,
+                    crossattn_cache,
+                )
+                if _st.VACE_REUSE and _st.PASS_STEP == 0:
+                    _st._vace_cache = (key, hints)
             if prefix > 0:
                 hints = tuple(torch.nn.functional.pad(h, (0, 0, prefix, 0)) for h in hints)
 

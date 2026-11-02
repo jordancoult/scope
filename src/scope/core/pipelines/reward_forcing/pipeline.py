@@ -15,7 +15,7 @@ from ..defaults import (
     resolve_input_mode,
 )
 from ..interface import Pipeline, Requirements
-from ..process import postprocess_chunk
+from ..process import postprocess_chunk, to_cpu_uint8
 from ..utils import Quantization, load_model_config, validate_resolution
 from ..wan2_1.modules import attention_steer
 from ..wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
@@ -233,6 +233,9 @@ class RewardForcingPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             attention_steer.set_sink_frames(self.components.generator.model, kwargs["sink_frames"])
         if "attention_backend" in kwargs:
             attention_steer.set_backend(kwargs["attention_backend"])
+        if "vace_hint_reuse" in kwargs:
+            attention_steer.VACE_REUSE = bool(kwargs["vace_hint_reuse"])
+            attention_steer._vace_cache = None
 
         for k, v in kwargs.items():
             self.state.set(k, v)
@@ -268,4 +271,4 @@ class RewardForcingPipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         apply_mode_defaults_to_state(self.state, self.__class__, mode, kwargs)
 
         _, self.state = self.blocks(self.components, self.state)
-        return {"video": postprocess_chunk(self.state.values["output_video"])}
+        return {"video": to_cpu_uint8(postprocess_chunk(self.state.values["output_video"]))}
