@@ -218,7 +218,12 @@ class LongLive2Pipeline(Pipeline):
         every = 0 if kwargs.get("skip_clean_kv") else int(kwargs.get("clean_kv_every") or 2)
         os.environ["LL2_SKIP_CLEAN"] = "1" if every == 0 else "0"
         os.environ["LL2_CLEAN_EVERY"] = str(max(1, every))
-        if self.gen is None or prompt != self.prompt or kwargs.get("init_cache") or kwargs.get("reset_cache"):
+        # live seed: a new base_seed restarts the stream with new noise (as a prompt change does)
+        seed = kwargs.get("base_seed")
+        new_seed = seed is not None and int(seed) != self.seed
+        if new_seed:
+            self.seed = int(seed)
+        if self.gen is None or new_seed or prompt != self.prompt or kwargs.get("init_cache") or kwargs.get("reset_cache"):
             self._start(prompt)
         t0 = time.perf_counter()
         try:

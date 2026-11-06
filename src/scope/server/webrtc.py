@@ -1480,8 +1480,22 @@ class WebRTCManager:
         self.headless_session = None
 
 
+def _loopback_only() -> None:
+    """Local patch (ai-livestream): offer only 127.0.0.1 as a host candidate. aioice never offers loopback, so
+    a client on the same machine connected over the Wi-Fi address and the stream died when Wi-Fi went off."""
+    import aioice.ice
+
+    aioice.ice.get_host_addresses = lambda use_ipv4=True, use_ipv6=False: ["127.0.0.1"]
+
+
 def create_rtc_config() -> RTCConfiguration:
     """Setup RTCConfiguration with TURN credentials if available."""
+    # Local patch (ai-livestream): SCOPE_WEBRTC_LOCAL=1 = same-machine clients only (start_scope.sh --bridge
+    # default): loopback candidates, no STUN/TURN, no network needed at all.
+    if os.getenv("SCOPE_WEBRTC_LOCAL") == "1":
+        _loopback_only()
+        logger.info("SCOPE_WEBRTC_LOCAL=1: WebRTC over 127.0.0.1 only (no STUN/TURN, works offline)")
+        return RTCConfiguration(iceServers=[])
     try:
         from huggingface_hub import get_token
 
