@@ -1,3 +1,4 @@
+import os
 import logging
 from typing import Any
 
@@ -143,8 +144,30 @@ class SetupCachesBlock(ModularPipelineBlocks):
             components.config.max_rope_freq_table_seq_len
             - components.config.num_frame_per_block
         )
-        if block_state.current_start_frame >= max_current_start:
-            init_cache = True
+        if os.environ.get("SCOPE_ROPE_LIMIT"):  # testing: hit the limit after N latent frames
+            max_current_start = min(max_current_start, int(os.environ["SCOPE_ROPE_LIMIT"]))
+        # Local patch (ai-livestream): LongLive shifts its memory at the RoPE limit instead of resetting
+        # (no jump; see longlive/modules/causal_model.py ROPE_SHIFT). Other pipelines: stock reset.
+        _ll = None
+        if type(components.generator.model.blocks[0].self_attn).__module__.endswith("longlive.modules.causal_model"):
+            from scope.core.pipelines.longlive.modules import causal_model as _ll
+        rope_offset = _ll.ROPE_OFFSET if _ll is not None else 0
+        if block_state.current_start_frame - rope_offset >= max_current_start:
+            if (_ll is not None and _ll.ROPE_SHIFT and not init_cache and block_state.kv_cache is not None
+                    and block_state.current_start_frame > 0):
+                _sf = (components.config.vae_spatial_downsample_factor
+                       * components.config.patch_embedding_spatial_downsample_factor)
+                _ll.rope_shift_cache(
+                    block_state.kv_cache, components.generator.model,
+                    block_state.current_start_frame - rope_offset - max_current_start + 1,
+                    (block_state.height // _sf) * (block_state.width // _sf),
+                )
+                _n = state.get("_rope_shifts") or 0
+                state.set("_rope_shifts", _n + 1)
+                if _n % 100 == 0:
+                    logger.info(f"MEMORY SHIFT #{_n + 1}: RoPE offset {_ll.ROPE_OFFSET} frames (no reset)")
+            else:
+                init_cache = True
 
         # Clear KV cache when conditioning changes outside of a transition if manage_cache is enabled and video input is present.
         # Transitions include: embedding blending (_transition_active) and soft transitions (KV bias lowering).
@@ -219,6 +242,10 @@ class SetupCachesBlock(ModularPipelineBlocks):
                 "HARD CUT: Executing cache reset - current_start_frame=0, clearing VAE cache"
             )
             block_state.current_start_frame = 0
+            if _ll is not None:
+                _ll.ROPE_OFFSET = 0
+            for kv in block_state.kv_cache or []:
+                kv.pop("refreshed_sink_slots", None)
 
             components.vae.clear_cache()
 

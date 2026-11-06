@@ -116,4 +116,6 @@ def refresh_sink_slot(kv_cache, model, frame_seqlen: int, slot: int) -> bool:
     for kv in kv_cache:
         kv["k"][:, dst] = kv["k"][:, src]
         kv["v"][:, dst] = kv["v"][:, src]
+        # LongLive memory shift: refreshed slots age with the window (rotated on each shift)
+        kv.setdefault("refreshed_sink_slots", set()).add(slot)
     return True

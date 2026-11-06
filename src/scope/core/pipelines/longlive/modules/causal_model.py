@@ -1,3 +1,4 @@
+import os
 # Modified from https://github.com/NVlabs/LongLive
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
 import math
@@ -30,6 +31,43 @@ from .model import (
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs"
 )
+
+
+# Local patch (ai-livestream): memory shift instead of a reset at the RoPE table limit.
+# Stock Scope wipes the KV cache when current_start_frame nears the 1024-entry RoPE table (a visible
+# jump every ~3.4 min at 20 fps). Cached keys are stored already rotated, and RoPE is a rotation, so
+# rotating the cached recent-window keys back by `delta` frames keeps every relative distance exact.
+# ROPE_OFFSET is subtracted from the bookkeeping frame index (which keeps counting) to get the RoPE
+# position, so generation stays pinned just under the limit. The original sink frames are not
+# rotated: their distance to the current chunk stays at ~1020, which the model already sees right
+# before the stock reset. Keyframe-memory sink slots (copies of recent frames) are rotated with the
+# window so they keep ageing. SCOPE_ROPE_SHIFT=0 = stock reset.
+ROPE_SHIFT = os.environ.get("SCOPE_ROPE_SHIFT", "1") != "0"
+ROPE_OFFSET = 0
+
+
+def rope_shift_cache(kv_cache, model, delta: int, frame_seqlen: int) -> None:
+    """Rotate every block's cached keys (recent window + refreshed sink slots) back by `delta` frames."""
+    global ROPE_OFFSET
+    if delta <= 0:
+        return
+    head_dim = kv_cache[0]["k"].shape[-1]
+    ct = (head_dim - 4 * (head_dim // 6)) // 2  # complex channels of the temporal RoPE axis
+    dev = kv_cache[0]["k"].device
+    rot = rope_params(delta + 1, 2 * ct)[delta].conj().to(device=dev, dtype=torch.complex64)
+    for block, kv in zip(model.blocks, kv_cache):
+        sink_tokens = block.self_attn.sink_size * frame_seqlen
+        le = int(kv["local_end_index"].item())
+        spans = [(sink_tokens, le)] + [
+            (sl * frame_seqlen, (sl + 1) * frame_seqlen) for sl in kv.get("refreshed_sink_slots", ())
+        ]
+        for a, b in spans:
+            if b <= a:
+                continue
+            seg = kv["k"][:, a:b, :, : 2 * ct]
+            x = torch.view_as_complex(seg.float().reshape(*seg.shape[:-1], ct, 2).contiguous())
+            kv["k"][:, a:b, :, : 2 * ct] = torch.view_as_real(x * rot).flatten(-2).to(seg.dtype)
+    ROPE_OFFSET += delta
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -250,11 +288,12 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
+            rope_frame = current_start_frame - ROPE_OFFSET  # Local patch: memory shift (see ROPE_SHIFT)
             roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame
+                q, grid_sizes, freqs, start_frame=rope_frame
             ).type_as(v)
             roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame
+                k, grid_sizes, freqs, start_frame=rope_frame
             ).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
