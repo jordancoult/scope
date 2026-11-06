@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import torch
@@ -12,6 +13,23 @@ from diffusers.modular_pipelines.modular_pipeline_utils import (
     OutputParam,
 )
 
+
+
+def forever_noise_seed(state, base_seed: int, current_start_frame: int, num_frames: int) -> int:
+    """Local patch (ai-livestream): noise seed from a frame counter that never resets. Stock Scope seeds each
+    chunk with base_seed + current_start_frame, and current_start_frame goes back to 0 on every memory reset
+    (prompt change, and automatically every ~1020 latent frames at the RoPE limit), so the same noise
+    sequence replayed and the scene looped every few minutes. SCOPE_NOISE_RESTART=1 = stock behaviour."""
+    if os.environ.get("SCOPE_NOISE_RESTART") == "1":
+        return base_seed + current_start_frame
+    # The seed set in the UI is the starting seed: a new base_seed restarts the count (seed X always gives
+    # X, X+1, ...). Wrapped into torch's seed range so it can never overflow.
+    if state.get("_noise_base") != base_seed:
+        state.set("_noise_base", base_seed)
+        state.set("_noise_frame", 0)
+    n = state.get("_noise_frame") or 0
+    state.set("_noise_frame", n + num_frames)
+    return (base_seed + n) % (2**63)
 
 class PrepareLatentsBlock(ModularPipelineBlocks):
     model_name = "Wan2.1"
@@ -90,15 +108,14 @@ class PrepareLatentsBlock(ModularPipelineBlocks):
             base_seed = 42
 
         # Create generator from seed for reproducible generation
-        block_seed = base_seed + block_state.current_start_frame
-        rng = torch.Generator(device=generator_param.device).manual_seed(block_seed)
-
         # Determine number of latent frames to generate
         num_latent_frames = components.config.num_frame_per_block
         # VAE stream_decode requires at least 2 latent frames on first batch
         # because it splits into x[:,:,:1,:,:] and x[:,:,1:,:,:] (second part must be non-empty)
         if block_state.current_start_frame == 0 and num_latent_frames < 2:
             num_latent_frames = 2
+        block_seed = forever_noise_seed(state, base_seed, block_state.current_start_frame, num_latent_frames)
+        rng = torch.Generator(device=generator_param.device).manual_seed(block_seed)
 
         # Generate empty latents (noise)
         latents = torch.randn(

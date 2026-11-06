@@ -14,6 +14,8 @@ from diffusers.modular_pipelines.modular_pipeline_utils import (
 )
 
 
+from .prepare_latents import forever_noise_seed
+
 class PrepareVideoLatentsBlock(ModularPipelineBlocks):
     model_name = "Wan2.1"
 
@@ -119,7 +121,7 @@ class PrepareVideoLatentsBlock(ModularPipelineBlocks):
         if fixed:
             block_seed = base_seed
         else:
-            block_seed = base_seed + block_state.current_start_frame
+            block_seed = forever_noise_seed(state, base_seed, block_state.current_start_frame, latents.shape[1])
         rng = torch.Generator(device=components.config.device).manual_seed(block_seed)
 
         # Generate empty latents (noise)
