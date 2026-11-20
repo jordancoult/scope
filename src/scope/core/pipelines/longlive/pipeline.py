@@ -64,6 +64,14 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         tokenizer_path = getattr(config, "tokenizer_path", None)
 
         model_config = load_model_config(config, __file__)
+        # Local patch (ai-character-scope): SCOPE_FRAMES_PER_BLOCK=N latent frames per chunk (stock 3 = 12 video
+        # frames). Fewer frames per chunk = lower latency (the camera fills a chunk faster). Unset = stock.
+        _fpb = os.environ.get("SCOPE_FRAMES_PER_BLOCK", "").strip()
+        if _fpb:
+            from omegaconf import OmegaConf
+
+            model_config = OmegaConf.merge(model_config, {"num_frame_per_block": int(_fpb)})
+            logger.info(f"SCOPE_FRAMES_PER_BLOCK: {int(_fpb)} latent frames per chunk")
         base_model_name = getattr(model_config, "base_model_name", "Wan2.1-T2V-1.3B")
         base_model_kwargs = getattr(model_config, "base_model_kwargs", {})
         generator_model_name = getattr(
