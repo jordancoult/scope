@@ -72,6 +72,14 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
 
             model_config = OmegaConf.merge(model_config, {"num_frame_per_block": int(_fpb)})
             logger.info(f"SCOPE_FRAMES_PER_BLOCK: {int(_fpb)} latent frames per chunk")
+        # Local patch: SCOPE_LOCAL_ATTN_SIZE=N latent frames of attention window / KV cache (stock 12, trained value).
+        # Larger = longer temporal memory, more VRAM (~0.29 GB per latent frame at 832x480). Unset = stock.
+        _las = os.environ.get("SCOPE_LOCAL_ATTN_SIZE", "").strip()
+        if _las:
+            from omegaconf import OmegaConf
+
+            model_config = OmegaConf.merge(model_config, {"local_attn_size": int(_las)})
+            logger.info(f"SCOPE_LOCAL_ATTN_SIZE: {int(_las)} latent frames of memory")
         base_model_name = getattr(model_config, "base_model_name", "Wan2.1-T2V-1.3B")
         base_model_kwargs = getattr(model_config, "base_model_kwargs", {})
         generator_model_name = getattr(
